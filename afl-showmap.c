@@ -28,6 +28,7 @@
 #include "types.h"
 #include "debug.h"
 #include "alloc-inl.h"
+#include "afl-run.h"
 
 #include <stdio.h>
 #include <unistd.h>
@@ -47,62 +48,13 @@
 #include <sys/types.h>
 #include <sys/resource.h>
 
-static s32 child_pid;                 /* PID of the tested program         */
-
-static u8* trace_bits;                /* SHM with instrumentation bitmap   */
-
-static s32 shm_id;                    /* ID of the SHM region              */
+u32 exec_tmout = EXEC_TIMEOUT;        /* Configurable exec timeout (ms)   */
+u64 mem_limit = 4*1024L;            /* Memory cap for child (MB)        */
+s32 child_pid = -1;                   /* PID of the fuzzed program        */
 
 static u8  sink_output,               /* Sink program output               */
            be_quiet,                  /* Quiet mode (tuples & errors only) */
            minimize_mode;             /* Called from minimize_corpus.sh?   */
-
-/* Classify tuple counts. */
-
-#define AREP4(_sym) (_sym), (_sym), (_sym), (_sym)
-#define AREP8(_sym) AREP4(_sym), AREP4(_sym)
-#define AREP16(_sym) AREP8(_sym), AREP8(_sym)
-#define AREP32(_sym) AREP16(_sym), AREP16(_sym)
-#define AREP64(_sym) AREP32(_sym), AREP32(_sym)
-#define AREP128(_sym) AREP64(_sym), AREP64(_sym)
-
-static u8 count_class_lookup[256] = {
-
-  /* 0 - 3:       4 */ 0, 1, 2, 3,
-  /* 4 - 7:      +4 */ AREP4(4),
-  /* 8 - 15:     +8 */ AREP8(5),
-  /* 16 - 31:   +16 */ AREP16(6),
-  /* 32 - 127:  +96 */ AREP64(7), AREP32(7),
-  /* 128+:     +128 */ AREP128(8)
-
-};
-
-static void classify_counts(u8* mem) {
-
-  u32 i = MAP_SIZE;
-
-  if (getenv("AFL_EDGES_ONLY")) {
-
-    while (i--) {
-
-      if (*mem) *mem = 1;
-      mem++;
-
-    }
-
-  } else {
-
-    while (i--) {
-
-      *mem = count_class_lookup[*mem];
-      mem++;
-
-    }
-
-  }
-
-}
-
 
 /* Show all recorded tuples. */
 
@@ -111,7 +63,11 @@ static inline void show_tuples(void) {
   u8* current = (u8*)trace_bits;
   u32 i;
 
-  classify_counts(trace_bits);
+#ifdef __x86_64__
+  classify_counts((u64*)trace_bits);
+#else
+  classify_counts((u32*)trace_bits);
+#endif /* ^__x86_64__ */
 
   if (minimize_mode) {
 
@@ -150,74 +106,43 @@ static inline u8 anything_set(void) {
 
 }
 
+/* Handle stop signal (Ctrl-C, etc). */
 
+static void handle_stop_sig(int sig) {
 
-/* Get rid of shared memory (atexit handler). */
+  stop_soon = 1; 
 
-static void remove_shm(void) {
-  shmctl(shm_id, IPC_RMID, NULL);
-}
-
-
-/* Configure shared memory. */
-
-static void setup_shm(void) {
-
-  u8* shm_str;
-
-  shm_id = shmget(IPC_PRIVATE, MAP_SIZE, IPC_CREAT | IPC_EXCL | 0600);
-
-  if (shm_id < 0) PFATAL("shmget() failed");
-
-  atexit(remove_shm);
-
-  shm_str = alloc_printf("%d", shm_id);
-
-  setenv(SHM_ENV_VAR, shm_str, 1);
-
-  ck_free(shm_str);
-
-  trace_bits = shmat(shm_id, NULL, 0);
-  
-  if (!trace_bits) PFATAL("shmat() failed");
+  if (child_pid > 0) kill(child_pid, SIGKILL);
+  if (forksrv_pid > 0) kill(forksrv_pid, SIGKILL);
 
 }
 
+/* Set up signal handlers. More complicated that needs to be, because libc on
+   Solaris doesn't resume interrupted reads(), sets SA_RESETHAND when you call
+   siginterrupt(), and does other stupid things. */
 
-/* Execute target application. */
+static void setup_signal_handlers(void) {
 
-static void run_target(char** argv) {
+  struct sigaction sa;
 
-  int status = 0;
+  sa.sa_handler   = NULL;
+  sa.sa_flags     = SA_RESTART;
+  sa.sa_sigaction = NULL;
 
-  child_pid = fork();
+  sigemptyset(&sa.sa_mask);
 
-  if (child_pid < 0) PFATAL("fork() failed");
+  /* Various ways of saying "stop". */
 
-  if (!child_pid) {
+  sa.sa_handler = handle_stop_sig;
+  sigaction(SIGHUP, &sa, NULL);
+  sigaction(SIGINT, &sa, NULL);
+  sigaction(SIGTERM, &sa, NULL);
 
-    if (sink_output) {
+  /* Things we don't care about. */
 
-      s32 fd = open("/dev/null", O_RDWR);
-
-      if (fd < 0) PFATAL("Cannot open /dev/null");
-
-      if (dup2(fd, 1) < 0 || dup2(fd, 2) < 0) PFATAL("dup2() failed");
-
-      close(fd);
-
-    }
-
-    execvp(argv[0], argv);
-
-    PFATAL("Unable to execute '%s'", argv[0]);
-
-  }
-
-  if (waitpid(child_pid, &status, WUNTRACED) <= 0) FATAL("waitpid() failed");
-
-  if (!minimize_mode && WIFSIGNALED(status))
-    SAYF("+++ Killed by signal %u +++\n", WTERMSIG(status));
+  sa.sa_handler = SIG_IGN;
+  sigaction(SIGTSTP, &sa, NULL);
+  sigaction(SIGPIPE, &sa, NULL);
 
 }
 
@@ -256,12 +181,15 @@ int main(int argc, char** argv) {
   if (argc < 2) usage(argv[0]);
 
   setup_shm();
+  setup_signal_handlers();
 
   if (minimize_mode || getenv("AFL_SINK_OUTPUT")) sink_output = 1;
 
   if (!be_quiet && !sink_output)
     SAYF("\n-- Program output begins --\n");  
 
+  target_path = argv[1];
+  showmap_mode = 1;
   run_target(argv + 1);
 
   if (!be_quiet && !sink_output)

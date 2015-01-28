@@ -8,6 +8,10 @@
 
    Copyright 2013, 2014 Google Inc. All rights reserved.
 
+   Speed improvement using ptrace by Choongwoo Han <cwhan.tunz@gmail.com>
+
+   Copyright 2015 Naver Corp.
+
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
    You may obtain a copy of the License at:
@@ -161,12 +165,11 @@ static const u8* main_payload_32 =
 #ifndef COVERAGE_ONLY
   "  xorl __afl_prev_loc, %ecx\n"
   "  xorl %ecx, __afl_prev_loc\n"
-#endif /* !COVERAGE_ONLY */
+  "  shrl $1, __afl_prev_loc\n"
   "\n"
-#ifdef COVERAGE_ONLY
-  "  orb  $1, (%edx, %ecx, 1)\n"
-#else
   "  incb (%edx, %ecx, 1)\n"
+#else
+  "  orb  $1, (%edx, %ecx, 1)\n"
 #endif /* ^COVERAGE_ONLY */
   "\n"
   "__afl_return:\n"
@@ -375,25 +378,48 @@ static const u8* main_payload_64 =
 #endif /* ^__OpenBSD__ */
   "  seto  %al\n"
   "\n"
-  "  /* Check if SHM region is already mapped. */\n"
   "\n"
-  "  movq  __afl_area_ptr(%rip), %rdx\n"
-  "  testq %rdx, %rdx\n"
+  "  /* stage 0 : Create shared memory.   */\n"
+  "  /* stage 1 : Init fork server.       */\n"
+  "  /* stage 2 : Trace flow (afl store). */\n"
+  "\n"
+  "  /* Check if SHM creation and Init fork server is finished. */\n"
+  "  movb  __afl_stage(%rip), %dl\n"
+  "  cmpb  $2, %dl\n"
+  "  je    __afl_store\n"
+  "\n"
+  "  /* Check if it is first time. */\n"
+  "  testb  %dl, %dl\n"
   "  je    __afl_setup\n"
   "\n"
+  "__afl_check_addr:\n"
+  "  /* If this is start address, Init fork server. */\n"
+  "  movq  (%rsp), %rdx\n"
+  "  cmpq  %rdx, __afl_start_addr(%rip)\n"
+  "  jne   __afl_save_addr\n"
+  "  jmp   __afl_setup\n"
+  "\n"
+  "__afl_save_addr:\n"
+  "  /* Save return address. */\n"
+  "  movq  (%rsp), %rcx\n"
+  "  movq  __afl_area_ptr(%rip), %rdx\n"
+  "  movq  %rcx, (%rdx)\n"
+  "  jmp   __afl_return\n"
+  "\n"
   "__afl_store:\n"
+  "\n"
+  "  movq  __afl_area_ptr(%rip), %rdx\n"
   "\n"
   "  /* Calculate and store hit for the code location specified in ecx. */\n"
   "\n"
 #ifndef COVERAGE_ONLY
   "  xorq __afl_prev_loc(%rip), %rcx\n"
   "  xorq %rcx, __afl_prev_loc(%rip)\n"
-#endif /* !COVERAGE_ONLY */
+  "  shrq $1, __afl_prev_loc(%rip)\n"
   "\n"
-#ifdef COVERAGE_ONLY
-  "  orb  $1, (%rdx, %rcx, 1)\n"
-#else
   "  incb (%rdx, %rcx, 1)\n"
+#else
+  "  orb  $1, (%rdx, %rcx, 1)\n"
 #endif /* ^COVERAGE_ONLY */
   "\n"
   "__afl_return:\n"
@@ -414,6 +440,11 @@ static const u8* main_payload_64 =
   "\n"
   "  cmpb $0, __afl_setup_failure(%rip)\n"
   "  jne __afl_return\n"
+  "\n"
+  "  /* Skip creating SHM. */\n"
+  "\n"
+  "  cmpb  $1, __afl_stage(%rip)\n"
+  "  je    __afl_setup_first\n"
   "\n"
   "  /* Check out if we have a global pointer on file. */\n"
   "\n"
@@ -473,6 +504,11 @@ static const u8* main_payload_64 =
   "  subq  $16, %rsp\n"
   "  andq  $0xfffffffffffffff0, %rsp\n"
   "\n"
+  "  /* Skip creating SHM. */\n"
+  "\n"
+  "  cmpb  $1, __afl_stage(%rip)\n"
+  "  je    __afl_forkserver\n"
+  "\n"
   "  leaq .AFL_SHM_ENV(%rip), %rdi\n"
   CALL_L64("getenv")
   "\n"
@@ -501,13 +537,51 @@ static const u8* main_payload_64 =
   "  movq __afl_global_area_ptr@GOTPCREL(%rip), %rdx\n"
   "  movq %rax, (%rdx)\n"
 #endif /* ^__APPLE__ */
-  "  movq %rax, %rdx\n"
+  "\n"
+  "  /* Send pointer size to server */\n"
+  "  mov  $8, %edx               /* data      */\n"
+  "  mov  %edx, __afl_temp(%rip) /* data      */\n"
+  "  movq $4, %rdx               /* length    */\n"
+  "  leaq __afl_temp(%rip), %rsi /* data      */\n"
+  "  movq $" STRINGIFY((FORKSRV_FD + 1)) ", %rdi       /* file desc */\n"
+  CALL_L64("write")
+  "\n"
+  "  /* Set start address. */\n"
+  "  movq $8, %rdx               /* length    */\n"
+  "  leaq __afl_start_addr(%rip), %rsi /* data      */\n"
+  "  movq $" STRINGIFY((FORKSRV_FD)) ", %rdi       /* file desc */\n"
+  CALL_L64("read")
+  "\n"
+  "  /* Set stage 1. */\n"
+  "  movb  $1, __afl_stage(%rip)\n" 
+  "  /* Store the address of the SHM region. */\n"
+  "\n"
+  "  /* If we don't find first read point yet, trace me. */\n"
+  "  movq  __afl_start_addr(%rip), %rdx\n"
+  "  testq %rdx, %rdx\n"
+  "  jne   __afl_skip_fork\n"
+  "\n"
+  "  /* ptrace(PTRACE_TRACEME). */\n"
+  "  movq $0, %rdi\n"
+  "  movq $0, %rax\n"
+  CALL_L64("ptrace")
+  "\n"
+  CALL_L64("getpid")
+  "  mov  $0x13, %esi\n"
+  "  mov  %eax, %edi\n"
+  CALL_L64("kill")
+  "\n"
+  "  jmp   __afl_skip_fork\n"
+  "\n"
   "\n"
   "__afl_forkserver:\n"
+  "\n"
+  "  movb $2, __afl_stage(%rip)\n" 
   "\n"
   "  /* Enter the fork server mode to avoid the overhead of execve() calls. We\n"
   "     push rdx (area ptr) twice to keep stack alignment neat. */\n"
   "\n"
+  "  movq  __afl_area_ptr(%rip), %rdx\n"
   "  pushq %rdx\n"
   "  pushq %rdx\n"
   "\n"
@@ -583,6 +657,7 @@ static const u8* main_payload_64 =
   "  popq %rdx\n"
   "  popq %rdx\n"
   "\n"
+  "__afl_skip_fork:\n"
   "  movq %r12, %rsp\n"
   "  popq %r12\n"
   "\n"
@@ -614,6 +689,14 @@ static const u8* main_payload_64 =
   "\n"
   "  leaq 352(%rsp), %rsp\n"
   "\n"
+  "  /* Finish stage 0. */\n"
+  "  cmpb  $1, __afl_stage(%rip)\n"
+  "  je    __afl_check_addr\n"
+  "\n"
+  "  /* Clear trace bits (saved address) */\n"
+  "  movq __afl_area_ptr(%rip), %rdx\n"
+  "  movq $0, (%rdx)\n"
+  "\n"
   "  jmp  __afl_store\n"
   "\n"
   "__afl_die:\n"
@@ -627,8 +710,6 @@ static const u8* main_payload_64 =
   "     shmget() / shmat() over and over again. */\n"
   "\n"
   "  incb __afl_setup_failure(%rip)\n"
-  "\n"
-  "__afl_setup_pop_and_continue:\n"
   "\n"
   "  movq %r12, %rsp\n"
   "  popq %r12\n"
@@ -669,6 +750,8 @@ static const u8* main_payload_64 =
 #ifdef __APPLE__
 
   "  .comm   __afl_area_ptr, 8\n"
+  "  .comm   __afl_start_addr, 8\n"
+  "  .comm   __afl_stage, 1\n"
 #ifndef COVERAGE_ONLY
   "  .comm   __afl_prev_loc, 8\n"
 #endif /* !COVERAGE_ONLY */
@@ -679,6 +762,8 @@ static const u8* main_payload_64 =
 #else
 
   "  .lcomm   __afl_area_ptr, 8\n"
+  "  .lcomm   __afl_start_addr, 8\n"
+  "  .lcomm   __afl_stage, 1\n"
 #ifndef COVERAGE_ONLY
   "  .lcomm   __afl_prev_loc, 8\n"
 #endif /* !COVERAGE_ONLY */

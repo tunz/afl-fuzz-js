@@ -188,6 +188,8 @@ static void edit_params(u32 argc, char** argv) {
 
     }
 
+    if (!strcmp(cur, "-Wstrict-overflow")) continue;
+
     if (!strcmp(cur, "-integrated-as")) continue;
 
     if (!strcmp(cur, "-pipe")) continue;

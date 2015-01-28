@@ -166,15 +166,21 @@ for fn in `ls -rS "$DIR"`; do
   CUR=$((CUR+1))
   printf "\\r    Processing file $CUR/$CCOUNT... "
 
-  for tuple in `cat ".traces/$fn"`; do
-
-    BEST_FILE[tuple]="${BEST_FILE[tuple]:-$fn}"
-
-  done
+  sed 's/$/ '"$fn"'/' ".traces/$fn" >>".traces/.candidate_list"
 
 done
 
 echo
+echo "[*] Sorting candidate list (be patient)..."
+
+# Grab first mention for each tuple; smaller files will appear earlier because
+ of the use of ls -rS in the recently-executed loop.
+
+sort -k1,1 -s -u ".traces/.candidate_list" | \
+  sed 's/^/BEST_FILE[/;s/ /]="/;s/$/"/' >".traces/.candidate_script"
+
+. ".traces/.candidate_script"
+
 echo "[*] Processing candidates and writing output files..."
 
 touch .traces/.already_have

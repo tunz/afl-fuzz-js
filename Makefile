@@ -14,7 +14,7 @@
 #
 
 PROGNAME    = afl
-VERSION     = 1.06b
+VERSION     = 1.18c
 
 PREFIX     ?= /usr/local
 BIN_PATH    = $(PREFIX)/bin
@@ -35,7 +35,7 @@ else
   TEST_CC   = afl-clang
 endif
 
-COMM_HDR    = alloc-inl.h config.h debug.h types.h
+COMM_HDR    = alloc-inl.h config.h debug.h types.h afl-run.h
 
 all: test_x86 $(PROGS) test_build all_done
 
@@ -53,11 +53,11 @@ afl-as: afl-as.c afl-as.h $(COMM_HDR) | test_x86
 	$(CC) $(CFLAGS) $(LDFLAGS) $@.c -o $@
 	ln -s afl-as as  2>/dev/null || true
 
-afl-fuzz: afl-fuzz.c $(COMM_HDR) | test_x86
-	$(CC) $(CFLAGS) $(LDFLAGS) $@.c -o $@
+afl-fuzz: afl-fuzz.c afl-run.c $(COMM_HDR) | test_x86
+	$(CC) $(CFLAGS) $(LDFLAGS) afl-fuzz.c afl-run.c -o $@
 
-afl-showmap: afl-showmap.c $(COMM_HDR) | test_x86
-	$(CC) $(CFLAGS) $(LDFLAGS) $@.c -o $@
+afl-showmap: afl-showmap.c afl-run.c $(COMM_HDR) | test_x86
+	$(CC) $(CFLAGS) $(LDFLAGS) afl-showmap.c afl-run.c -o $@
 
 test_build: afl-gcc afl-as afl-showmap
 	@echo "[*] Testing the CC wrapper and instrumentation output..."

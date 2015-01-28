@@ -4,7 +4,7 @@
 
    Written and maintained by Michal Zalewski <lcamtuf@google.com>
 
-   Copyright 2013, 2014 Google Inc. All rights reserved.
+   Copyright 2013, 2014, 2015 Google Inc. All rights reserved.
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -31,7 +31,7 @@
 
 /* Comment out to disable fancy ANSI boxes and use poor man's 7-bit UI: */
 
-#define FANCY_BOXES
+// #define FANCY_BOXES
 
 /* Default timeout for fuzzed code (milliseconds): */
 
@@ -49,7 +49,7 @@
    cases that show variable behavior): */
 
 #define CAL_CYCLES          10
-#define CAL_CYCLES_LONG     50
+#define CAL_CYCLES_LONG     30
 
 /* Number of subsequent hangs before abandoning an input file: */
 
@@ -62,12 +62,16 @@
 
 /* Baseline number of random tweaks during a single 'havoc' stage: */
 
-#define HAVOC_CYCLES        5000
+#define HAVOC_CYCLES        500
 
 /* Maximum multiplier for the above (should be a power of two, beware
    of 32-bit int overflows): */
 
 #define HAVOC_MAX_MULT      16
+
+/* Absolute minimum number of havoc cycles (After all adjustments): */
+
+#define HAVOC_MIN           10
 
 /* Maximum stacking for havoc-stage tweaks. The actual value is calculated
    like this: 
@@ -100,7 +104,7 @@
 
 /* Nominal per-splice havoc cycle length: */
 
-#define SPLICE_HAVOC        500
+#define SPLICE_HAVOC        50
 
 /* Maximum value for integer addition / subtraction stages: */
 
@@ -117,13 +121,27 @@
 
 #define MAX_FILE            (1 * 1024 * 1024)
 
-/* Maximum "extra" token size (-x), in bytes: */
+/* Maximum dictionary token size (-x), in bytes: */
 
-#define MAX_EXTRA_FILE      128
+#define MAX_DICT_FILE      128
 
-/* Maximum number of extras to still carry out deterministic steps: */
+/* Length limits for auto-detected dictionary tokens: */
 
-#define MAX_DET_EXTRAS      500
+#define MIN_AUTO_EXTRA     3
+#define MAX_AUTO_EXTRA     60
+
+/* Maximum number of user-specified dictionary tokens to use in deterministic
+   steps; past this point, the "extras/user" step will be still carried out,
+   but with proportionally lower odds: */
+
+#define MAX_DET_EXTRAS      200
+
+/* Maximum number of auto-extracted dictionary tokens to actually use in fuzzing
+   (first value), and to keep in memory as candidates. The latter should be much
+   higher than the former. */
+
+#define USE_AUTO_EXTRAS     50
+#define MAX_AUTO_EXTRAS     (USE_AUTO_EXTRAS * 10)
 
 /* UI refresh frequency (Hz): */
 
@@ -138,7 +156,7 @@
 
 #define AVG_SMOOTHING       25
 
-/* Sync interval (havoc cycles): */
+/* Sync interval (every n havoc cycles): */
 
 #define SYNC_INTERVAL       5
 
@@ -222,28 +240,39 @@
 #define CAL_TMOUT_PERC      125
 #define CAL_TMOUT_ADD       50
 
+/* Number of chances to calibrate a case before giving up: */
+
+#define CAL_CHANCES         3
+
 /* Map size for the traced binary (2^MAP_SIZE_POW2). Must be greater than
    2; you probably want to keep it under 18 or so for performance reasons
    (adjusting AFL_INST_RATIO when compiling is probably a better way to solve
    problems). You need to recompile the target binary after changing this -
    otherwise, SEGVs may ensue. */
 
-#define MAP_SIZE_POW2       16
+#define MAP_SIZE_POW2       17
 #define MAP_SIZE            (1 << MAP_SIZE_POW2)
 
 /* Maximum allocator request size (keep well under INT_MAX): */
 
 #define MAX_ALLOC           0x40000000
 
+/* A made-up hashing seed: */
+
+#define HASH_CONST          0xa5b35705
+
 /* Uncomment this to use inferior line-coverage-based instrumentation. Note
    that you need to recompile the target binary for this to have any effect: */
 
-// #define COVERAGE_ONLY
+#define COVERAGE_ONLY
 
 /* Uncomment this to use instrumentation data to record newly discovered paths,
    but do not use them as seeds for fuzzing. This is useful for conveniently
    measuring coverage that could be attaine by a "dumb" fuzzing algorithm: */
 
 // #define IGNORE_FINDS
+
+// #define ERR_THRESHOLD       100
+#define AUTO_EXTRA_THRESH      100
 
 #endif /* ! _HAVE_CONFIG_H */

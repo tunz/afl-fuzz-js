@@ -6,7 +6,12 @@
 
    Forkserver design by Jann Horn <jannhorn@googlemail.com>
 
-   Copyright 2013, 2014 Google Inc. All rights reserved.
+   Copyright 2013, 2014, 2015 Google Inc. All rights reserved.
+
+   Extraction auto dictionary using comment and threshold check
+   by Choongwoo Han <cwhan.tunz@gmail.com>
+
+   Copyright 2015 Naver Corp.
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -20,6 +25,8 @@
 
  */
 
+//#define DEBUG_LOG
+
 #define AFL_MAIN
 #define MESSAGES_TO_STDOUT
 
@@ -31,6 +38,7 @@
 #include "debug.h"
 #include "alloc-inl.h"
 #include "hash.h"
+#include "afl-run.h"
 
 #include <stdio.h>
 #include <unistd.h>
@@ -58,59 +66,35 @@
 #  include <sys/sysctl.h>
 #endif /* __APPLE__ || __FreeBSD__ || __OpenBSD__ */
 
+u32 exec_tmout = EXEC_TIMEOUT;        /* Configurable exec timeout (ms)   */
+u64 mem_limit = MEM_LIMIT;            /* Memory cap for child (MB)        */
+s32 child_pid = -1;                   /* PID of the fuzzed program        */
 
 /* Lots of globals, but mostly for the status UI and other things where it
    really makes no sense to haul them around as function parameters. */
 
 static u8 *in_dir,                    /* Directory with initial testcases */
-          *out_file,                  /* File to fuzz, if any             */
           *out_dir,                   /* Working & output directory       */
           *sync_dir,                  /* Synchronization directory        */
           *sync_id,                   /* Fuzzer ID                        */
-          *use_banner,                /* Display banner                   */
-          *in_bitmap,                 /* Input bitmap                     */
-          *doc_path,                  /* Path to documentation dir        */
-          *target_path;               /* Path to target binary            */
-
-static u32 exec_tmout = EXEC_TIMEOUT; /* Configurable exec timeout (ms)   */
-static u64 mem_limit = MEM_LIMIT;     /* Memory cap for child (MB)        */
+          *use_banner;                /* Display banner                   */
 
 static u32 stats_update_freq = 1;     /* Stats update frequency (execs)   */
 
 static u8  skip_deterministic,        /* Skip deterministic stages?       */
            force_deterministic,       /* Force deterministic stages?      */
            use_splicing,              /* Recombine input files?           */
-           dumb_mode,                 /* Run in non-instrumented mode?    */
            score_changed,             /* Scoring for favorites changed?   */
-           kill_signal,               /* Signal that killed the child     */
            resuming_fuzz,             /* Resuming an older fuzzing job?   */
            timeout_given,             /* Specific timeout given?          */
            not_on_tty,                /* stdout is not a tty              */
-           uses_asan,                 /* Target uses ASAN?                */
-           no_forkserver,             /* Disable forkserver?              */
            crash_mode,                /* Crash mode! Yeah!                */
-           in_place_resume;           /* Attempt in-place resume?         */
-    
-static s32 out_fd,                    /* Persistent fd for out_file       */
-           dev_urandom_fd,            /* Persistent fd for /dev/urandom   */
-           dev_null_fd,               /* Persistent fd for /dev/null      */
-           fsrv_ctl_fd,               /* Fork server control pipe (write) */
-           fsrv_st_fd;                /* Fork server status pipe (read)   */
+           in_place_resume,           /* Attempt in-place resume?         */
+           auto_changed,              /* Auto-generated tokens changed?   */
+	   no_cpu_meter_red,          /* Feng shui on the status screen   */
+	   bitmap_changed = 1;        /* Time to update bitmap?           */
 
-static s32 forksrv_pid,               /* PID of the fork server           */
-           child_pid = -1;            /* PID of the fuzzed program        */
-
-static u8* trace_bits;                /* SHM with instrumentation bitmap  */
-
-static u8  virgin_bits[MAP_SIZE],     /* Regions yet untouched by fuzzing */
-           virgin_hang[MAP_SIZE],     /* Bits we haven't seen in hangs    */
-           virgin_crash[MAP_SIZE];    /* Bits we haven't seen in crashes  */
-
-static s32 shm_id;                    /* ID of the SHM region             */
-
-static volatile u8 stop_soon,         /* Ctrl-C pressed?                  */
-                   clear_screen = 1,  /* Window resized?                  */
-                   child_timed_out;   /* Traced process timed out?        */
+static volatile u8 clear_screen = 1;  /* Window resized?                  */
 
 static u32 queued_paths,              /* Total number of queued testcases */
            queued_variable,           /* Testcases with variable behavior */
@@ -125,13 +109,13 @@ static u32 queued_paths,              /* Total number of queued testcases */
            cur_depth,                 /* Current path depth               */
            max_depth,                 /* Max path depth                   */
            useless_at_start,          /* Number of useless starting paths */
-           current_entry;             /* Current queue entry ID           */
+           current_entry,             /* Current queue entry ID           */
+	   havoc_div = 1;             /* Cycle count divisor for havoc    */
 
 static u64 total_crashes,             /* Total number of crashes          */
            unique_crashes,            /* Crashes with unique signatures   */
            total_hangs,               /* Total number of hangs            */
            unique_hangs,              /* Hangs with unique signatures     */
-           total_execs,               /* Total execve() calls             */
            start_time,                /* Unix start time (ms)             */
            last_path_time,            /* Time for most recent path (ms)   */
            last_crash_time,           /* Time for most recent crash (ms)  */
@@ -213,16 +197,18 @@ static struct queue_entry*
 struct extra_data {
   u8* data;                           /* Dictionary token data            */
   u32 len;                            /* Dictionary token length          */
+  u32 hit_cnt;                        /* Use count in the corpus          */
 };
 
 static struct extra_data* extras;     /* Extra tokens to fuzz with        */
 static u32 extras_cnt;                /* Total number of tokens read      */
 
+static struct extra_data* a_extras;   /* Automatically select extras      */
+static u32 a_extras_cnt;              /* Total number of tokens available */
+
 /* Interesting values, as per config.h */
 
-static s8  interesting_8[]  = { INTERESTING_8 };
-static s16 interesting_16[] = { INTERESTING_8, INTERESTING_16 };
-static s32 interesting_32[] = { INTERESTING_8, INTERESTING_16, INTERESTING_32 };
+static char ascii_printable[96] = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~ \n";
 
 /* Fuzzing stages */
 
@@ -233,13 +219,10 @@ enum {
   STAGE_FLIP8,
   STAGE_FLIP16,
   STAGE_FLIP32,
-  STAGE_ARITH8,
-  STAGE_ARITH16,
-  STAGE_ARITH32,
-  STAGE_INTEREST8,
-  STAGE_INTEREST16,
-  STAGE_INTEREST32,
-  STAGE_EXTRAS,
+  STAGE_COMMENT,
+  STAGE_EXTRAS_UO,
+  STAGE_EXTRAS_UI,
+  STAGE_EXTRAS_AO,
   STAGE_HAVOC,
   STAGE_SPLICE
 };
@@ -251,18 +234,6 @@ enum {
   STAGE_VAL_LE,
   STAGE_VAL_BE
 };
-
-/* Execution status fault codes */
-
-enum {
-  FAULT_NONE,
-  FAULT_HANG,
-  FAULT_CRASH,
-  FAULT_ERROR,
-  FAULT_NOINST,
-  FAULT_NOBITS
-};
-
 
 /* Get unix time in milliseconds */
 
@@ -427,66 +398,6 @@ static u8* DF(double val) {
 }
 
 
-/* Describe integer as memory size. */
-
-static u8* DMS(u64 val) {
-
-  static u8 tmp[12][16];
-  static u8 cur;
-
-  cur = (cur + 1) % 12;
-
-#define CHK_FORMAT(_divisor, _limit_mult, _fmt, _cast) do { \
-    if (val < (_divisor) * (_limit_mult)) { \
-      sprintf(tmp[cur], _fmt, ((_cast)val) / (_divisor)); \
-      return tmp[cur]; \
-    } \
-  } while (0)
-
-  /* 0-9999 */
-  CHK_FORMAT(1, 10000, "%llu B", u64);
-
-  /* 10.0k - 99.9k */
-  CHK_FORMAT(1024, 99.95, "%0.01f kB", double);
-
-  /* 100k - 999k */
-  CHK_FORMAT(1024, 1000, "%llu kB", u64);
-
-  /* 1.00M - 9.99M */
-  CHK_FORMAT(1024 * 1024, 9.995, "%0.02f MB", double);
-
-  /* 10.0M - 99.9M */
-  CHK_FORMAT(1024 * 1024, 99.95, "%0.01f MB", double);
-
-  /* 100M - 999M */
-  CHK_FORMAT(1024 * 1024, 1000, "%llu MB", u64);
-
-  /* 1.00G - 9.99G */
-  CHK_FORMAT(1024LL * 1024 * 1024, 9.995, "%0.02f GB", double);
-
-  /* 10.0G - 99.9G */
-  CHK_FORMAT(1024LL * 1024 * 1024, 99.95, "%0.01f GB", double);
-
-  /* 100G - 999G */
-  CHK_FORMAT(1024LL * 1024 * 1024, 1000, "%llu GB", u64);
-
-  /* 1.00T - 9.99G */
-  CHK_FORMAT(1024LL * 1024 * 1024 * 1024, 9.995, "%0.02f TB", double);
-
-  /* 10.0T - 99.9T */
-  CHK_FORMAT(1024LL * 1024 * 1024 * 1024, 99.95, "%0.01f TB", double);
-
-#undef CHK_FORMAT
-
-  /* 100T+ */
-  strcpy(tmp[cur], "infty");
-  return tmp[cur];
-
-}
-
-
-/* Describe time delta. Returns one static buffer, 34 chars of less. */
-
 static u8* DTD(u64 cur_ms, u64 event_ms) {
 
   static u8 tmp[64];
@@ -635,6 +546,24 @@ static void destroy_queue(void) {
 
 }
 
+#ifdef DEBUG_LOG
+
+static inline void write_log(u8* buf, int len, u32 cksum) {
+
+  s32 fd = open("log", O_RDWR | O_APPEND, 0600);
+
+  if (fd < 0) PFATAL("Unable to open 'log'");
+
+  ck_write(fd, buf, len, "log");
+
+  u8* cksum_str = alloc_printf("\n%u\n----------------------\n", cksum);
+  ck_write(fd, cksum_str, strlen(cksum_str), "log");
+  ck_free(cksum_str);
+
+  close(fd);
+}
+
+#endif
 
 /* Write bitmap to file. The bitmap is useful mostly for the secret
    -B option, to focus a separate fuzzing session on a particular
@@ -642,8 +571,14 @@ static void destroy_queue(void) {
 
 static inline void write_bitmap(void) {
 
-  u8* fname = alloc_printf("%s/fuzz_bitmap", out_dir);
-  s32 fd = open(fname, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  u8* fname;
+  s32 fd;
+
+  if (!bitmap_changed) return;
+  bitmap_changed = 0;
+
+  fname = alloc_printf("%s/fuzz_bitmap", out_dir);
+  fd = open(fname, O_WRONLY | O_CREAT | O_TRUNC, 0600);
 
   if (fd < 0) PFATAL("Unable to open '%s'", fname);
 
@@ -676,35 +611,76 @@ static inline void read_bitmap(u8* fname) {
    Updates the map, so subsequent calls will always return 0.
 
    This function is called after every exec() on a fairly large buffer, so
-   it needs to be fast. */
+   it needs to be fast. We do this in 32-bit and 64-bit flavors. */
+
+#define FFL(_b) (0xffULL << ((_b) << 3))
+#define FF(_b)  (0xff << ((_b) << 3))
 
 static inline u8 has_new_bits(u8* virgin_map) {
+
+#ifdef __x86_64__
+
+  u64* current = (u64*)trace_bits;
+  u64* virgin  = (u64*)virgin_map;
+
+  u32  i = (MAP_SIZE >> 3);
+
+#else
 
   u32* current = (u32*)trace_bits;
   u32* virgin  = (u32*)virgin_map;
 
   u32  i = (MAP_SIZE >> 2);
+
+#endif /* ^__x86_64__ */
+
   u8   ret = 0;
 
   while (i--) {
 
+#ifdef __x86_64__
+
+    u64 cur = *current;
+    u64 vir = *virgin;
+
+#else
+
+    u32 cur = *current;
+    u32 vir = *virgin;
+
+#endif /* ^__x86_64__ */
+
     /* Optimize for *current == ~*virgin, since this will almost always be the
        case. */
 
-    if (*current & *virgin) {
+    if (cur & vir) {
 
       if (ret < 2) {
 
-        u8* cur = (u8*)current;
-        u8* vir = (u8*)virgin;
+#ifdef __x86_64__
 
-        if ((cur[0] && vir[0] == 255) || (cur[1] && vir[1] == 255) ||
-            (cur[2] && vir[2] == 255) || (cur[3] && vir[3] == 255)) ret = 2;
+        if (((cur & FFL(0)) && (vir & FFL(0)) == FFL(0)) ||
+            ((cur & FFL(1)) && (vir & FFL(1)) == FFL(1)) ||
+            ((cur & FFL(2)) && (vir & FFL(2)) == FFL(2)) ||
+            ((cur & FFL(3)) && (vir & FFL(3)) == FFL(3)) ||
+            ((cur & FFL(4)) && (vir & FFL(4)) == FFL(4)) ||
+            ((cur & FFL(5)) && (vir & FFL(5)) == FFL(5)) ||
+            ((cur & FFL(6)) && (vir & FFL(6)) == FFL(6)) ||
+            ((cur & FFL(7)) && (vir & FFL(7)) == FFL(7))) ret = 2;
         else ret = 1;
+#else
+
+        if (((cur & FF(0)) && (vir & FF(0)) == FF(0)) ||
+            ((cur & FF(1)) && (vir & FF(1)) == FF(1)) ||
+           ((cur & FF(2)) && (vir & FF(2)) == FF(2)) ||
+            ((cur & FF(3)) && (vir & FF(3)) == FF(3))) ret = 2;
+        else ret = 1;
+
+#endif /* ^__x86_64__ */
 
       }
 
-      *virgin &= ~*current;
+      *virgin = vir & ~cur;
 
     }
 
@@ -713,7 +689,7 @@ static inline u8 has_new_bits(u8* virgin_map) {
 
   }
 
-  if (ret && virgin_map == virgin_bits) write_bitmap();
+  if (ret && virgin_map == virgin_bits) bitmap_changed = 1;
 
   return ret;
 
@@ -721,7 +697,7 @@ static inline u8 has_new_bits(u8* virgin_map) {
 
 
 /* Count the number of bits set in the provided bitmap. Used for the status
-   screen, does not have to be fast. */
+   screen several times every second, does not have to be fast. */
 
 static inline u32 count_bits(u8* mem) {
 
@@ -753,7 +729,8 @@ static inline u32 count_bits(u8* mem) {
 
 
 /* Count the number of bytes set in the bitmap. Called fairly sporadically,
-   mostly to calibrate and examine confirmed new paths. */
+   mostly to update the status screen or calibrate and examine confirmed
+   new paths. */
 
 static inline u32 count_bytes(u8* mem) {
 
@@ -766,10 +743,10 @@ static inline u32 count_bytes(u8* mem) {
     u32 v = *(ptr++);
 
     if (!v) continue;
-    if (v & 0x000000ff) ret++;
-    if (v & 0x0000ff00) ret++;
-    if (v & 0x00ff0000) ret++;
-    if (v & 0xff000000) ret++;
+    if (v & FF(0)) ret++;
+    if (v & FF(1)) ret++;
+    if (v & FF(2)) ret++;
+    if (v & FF(3)) ret++;
 
   }
 
@@ -779,7 +756,7 @@ static inline u32 count_bytes(u8* mem) {
 
 
 /* Count the number of non-255 bytes set in the bitmap. Used strictly for the
-   status screen. */
+   status screen. several calls per second or so. */
 
 static inline u32 count_non_255_bytes(u8* mem) {
 
@@ -795,10 +772,10 @@ static inline u32 count_non_255_bytes(u8* mem) {
        case. */
 
     if (v == 0xffffffff) continue;
-    if ((v & 0x000000ff) != 0x000000ff) ret++;
-    if ((v & 0x0000ff00) != 0x0000ff00) ret++;
-    if ((v & 0x00ff0000) != 0x00ff0000) ret++;
-    if ((v & 0xff000000) != 0xff000000) ret++;
+    if ((v & FF(0)) != FF(0)) ret++;
+    if ((v & FF(1)) != FF(1)) ret++;
+    if ((v & FF(2)) != FF(2)) ret++;
+    if ((v & FF(3)) != FF(3)) ret++;
 
   }
 
@@ -812,13 +789,6 @@ static inline u32 count_non_255_bytes(u8* mem) {
    is hit or not. Called on every new crash or hang, should be
    reasonably fast. */
 
-#define AREP4(_sym) (_sym), (_sym), (_sym), (_sym)
-#define AREP8(_sym) AREP4(_sym), AREP4(_sym)
-#define AREP16(_sym) AREP8(_sym), AREP8(_sym)
-#define AREP32(_sym) AREP16(_sym), AREP16(_sym)
-#define AREP64(_sym) AREP32(_sym), AREP32(_sym)
-#define AREP128(_sym) AREP64(_sym), AREP64(_sym)
-
 static u8 simplify_lookup[256] = { 
   /*    4 */ 1, 128, 128, 128,
   /*   +4 */ AREP4(128),
@@ -828,6 +798,39 @@ static u8 simplify_lookup[256] = {
   /*  +64 */ AREP64(128),
   /* +128 */ AREP128(128)
 };
+
+#ifdef __x86_64__
+
+static void simplify_trace(u64* mem) {
+
+  u32 i = MAP_SIZE >> 3;
+
+  while (i--) {
+
+    /* Optimize for sparse bitmaps. */
+
+    if (*mem) {
+
+      u8* mem8 = (u8*)mem;
+
+      mem8[0] = simplify_lookup[mem8[0]];
+      mem8[1] = simplify_lookup[mem8[1]];
+      mem8[2] = simplify_lookup[mem8[2]];
+      mem8[3] = simplify_lookup[mem8[3]];
+      mem8[4] = simplify_lookup[mem8[4]];
+      mem8[5] = simplify_lookup[mem8[5]];
+      mem8[6] = simplify_lookup[mem8[6]];
+      mem8[7] = simplify_lookup[mem8[7]];
+
+    } else *mem = 0x0101010101010101ULL;
+
+    mem++;
+
+  }
+
+}
+
+#else
 
 static void simplify_trace(u32* mem) {
 
@@ -853,55 +856,22 @@ static void simplify_trace(u32* mem) {
 
 }
 
+#endif /* ^__x86_64__ */
 
-/* Destructively classify execution counts in a trace. This is used as a
-   preprocessing step for any newly acquired traces. Called on every exec,
-   must be fast. */
 
-static u8 count_class_lookup[256] = {
+#if defined(ERR_THRESHOLD) || defined(AUTO_EXTRA_THRESH)
+static u32 bitmap_diff(u8 *bitmap1, u8 *bitmap2, size_t size)
+{
+	u32 err = 0;
+	int i;
 
-  /* 0 - 3:       4 */ 0, 1, 2, 4,
-  /* 4 - 7:      +4 */ AREP4(8),
-  /* 8 - 15:     +8 */ AREP8(16),
-  /* 16 - 31:   +16 */ AREP16(32),
-  /* 32 - 127:  +96 */ AREP64(64), AREP32(64),
-  /* 128+:     +128 */ AREP128(128)
+	for (i = 0; i < size; i ++)
+	  if (bitmap1[i] != bitmap2[i])
+	    err += abs(bitmap1[i] - bitmap2[i]);
 
-};
-
-static void classify_counts(u32* mem) {
-
-  u32 i = MAP_SIZE >> 2;
-
-  while (i--) {
-
-    /* Optimize for sparse bitmaps. */
-
-    if (*mem) {
-
-      u8* mem8 = (u8*)mem;
-
-      mem8[0] = count_class_lookup[mem8[0]];
-      mem8[1] = count_class_lookup[mem8[1]];
-      mem8[2] = count_class_lookup[mem8[2]];
-      mem8[3] = count_class_lookup[mem8[3]];
-
-    }
-
-    mem++;
-
-  }
-
+	return err;
 }
-
-
-/* Get rid of shared memory (atexit handler). */
-
-static void remove_shm(void) {
-
-  shmctl(shm_id, IPC_RMID, NULL);
-
-}
+#endif
 
 
 /* Compact trace bytes into a smaller bitmap. We effectively just drop the
@@ -1035,43 +1005,6 @@ static void cull_queue(void) {
 
 }
 
-
-/* Configure shared memory and virgin_bits. This is called at startup. */
-
-static void setup_shm(void) {
-
-  u8* shm_str;
-
-  if (!in_bitmap) memset(virgin_bits, 255, MAP_SIZE);
-
-  memset(virgin_hang, 255, MAP_SIZE);
-  memset(virgin_crash, 255, MAP_SIZE);
-
-  shm_id = shmget(IPC_PRIVATE, MAP_SIZE, IPC_CREAT | IPC_EXCL | 0600);
-
-  if (shm_id < 0) PFATAL("shmget() failed");
-
-  atexit(remove_shm);
-
-  shm_str = alloc_printf("%d", shm_id);
-
-  /* If somebody is asking us to fuzz instrumented binaries in dumb mode,
-     we don't want them to detect instrumentation, since we won't be sending
-     fork server commands. This should be replaced with better auto-detection
-     later on, perhaps? */
-
-  if (!dumb_mode)
-    setenv(SHM_ENV_VAR, shm_str, 1);
-
-  ck_free(shm_str);
-
-  trace_bits = shmat(shm_id, NULL, 0);
-  
-  if (!trace_bits) PFATAL("shmat() failed");
-
-}
-
-
 /* Read all testcases from the input directory, then queue them for testing.
    Called at startup. */
 
@@ -1171,13 +1104,19 @@ static void read_testcases(void) {
 
 /* Helper function for load_extras. */
 
-static int compare_extras(const void* p1, const void* p2) {
+static int compare_extras_len(const void* p1, const void* p2) {
   struct extra_data *e1 = (struct extra_data*)p1,
                     *e2 = (struct extra_data*)p2;
 
   return e1->len - e2->len;
 }
 
+static int compare_extras_use_d(const void* p1, const void* p2) {
+  struct extra_data *e1 = (struct extra_data*)p1,
+                    *e2 = (struct extra_data*)p2;
+
+  return e2->hit_cnt - e1->hit_cnt;
+}
 
 /* Read extras from the extras directory and sort them by size. */
 
@@ -1185,7 +1124,7 @@ static void load_extras(u8* dir) {
 
   DIR* d;
   struct dirent* de;
-  u32 min_len = MAX_EXTRA_FILE, max_len = 0;
+  u32 min_len = MAX_DICT_FILE, max_len = 0;
 
   ACTF("Loading extra dictionary from '%s'...", dir);
 
@@ -1210,9 +1149,9 @@ static void load_extras(u8* dir) {
 
     }
 
-    if (st.st_size > MAX_EXTRA_FILE)
+    if (st.st_size > MAX_DICT_FILE)
       FATAL("Extra '%s' is too big (%s, limit is %s)", fn,
-            DMS(st.st_size), DMS(MAX_EXTRA_FILE));
+            DMS(st.st_size), DMS(MAX_DICT_FILE));
 
     if (min_len > st.st_size) min_len = st.st_size;
     if (max_len < st.st_size) max_len = st.st_size;
@@ -1232,6 +1171,12 @@ static void load_extras(u8* dir) {
     close(fd);
     ck_free(fn);
 
+    if (extras[extras_cnt].data[st.st_size - 1] == '\n')
+    {
+      extras[extras_cnt].data[st.st_size - 1] = 0;
+      extras[extras_cnt].len -= 1;
+    }
+
     extras_cnt++;
 
   }
@@ -1239,7 +1184,7 @@ static void load_extras(u8* dir) {
   closedir(d);
   if (!extras_cnt) FATAL("No usable files in '%s'", dir);
 
-  qsort(extras, extras_cnt, sizeof(struct extra_data), compare_extras);
+  qsort(extras, extras_cnt, sizeof(struct extra_data), compare_extras_len);
 
   OKF("Loaded %u extra tokens, size range %s to %s.", extras_cnt,
       DMS(min_len), DMS(max_len));
@@ -1249,8 +1194,177 @@ static void load_extras(u8* dir) {
           DMS(max_len));
 
   if (extras_cnt > MAX_DET_EXTRAS)
-    WARNF("More than %u tokens - ignored for deterministic tests.",
+    WARNF("More than %u tokens - will use them probabilistically.",
           MAX_DET_EXTRAS);
+
+}
+
+/* Helper function for maybe_add_auto() */
+
+static inline u8 memcmp_nocase(u8* m1, u8* m2, u32 len) {
+
+  while (len--) if (tolower(*(m1++)) ^ tolower(*(m2++))) return 1;
+  return 0;
+
+}
+
+
+/* Maybe add automatic extra. */
+
+static void maybe_add_auto(u8* mem, u32 len) {
+
+  u32 i;
+
+  /* Allow users to specify that they don't want auto dictionaries. */
+
+  if (!MAX_AUTO_EXTRAS || !USE_AUTO_EXTRAS) return;
+
+  /* Skip runs of identical bytes. */
+
+  for (i = 1; i < len; i++)
+    if (mem[0] ^ mem[i]) break;
+
+  if (i == len) return;
+
+  /* Reject anything that matches existing extras. Do a case-insensitive
+     match. We optimize by exploiting the fact that extras[] are sorted
+     by size. */
+
+  for (i = 0; i < extras_cnt; i++)
+    if (extras[i].len >= len) break;
+
+  for (; i < extras_cnt && extras[i].len == len; i++)
+    if (!memcmp_nocase(extras[i].data, mem, len)) return;
+
+  /* Last but not least, check a_extras[] for matches. There are no
+     guarantees of a particular sort order. */
+
+  auto_changed = 1;
+
+  for (i = 0; i < a_extras_cnt; i++) {
+
+    /* Exception of comment method */
+    if (a_extras[i].len > len && !memcmp_nocase(a_extras[i].data + (a_extras[i].len - len), mem, len))
+	    return;
+
+    if (a_extras[i].len == len && !memcmp_nocase(a_extras[i].data, mem, len)) {
+
+      a_extras[i].hit_cnt++;
+      goto sort_a_extras;
+
+    }
+
+  }
+
+  /* At this point, looks like we're dealing with a new entry. So, let's
+     append it if we have room. Otherwise, let's randomly evict some other
+     entry from the bottom half of the list. */
+
+  if (a_extras_cnt < MAX_AUTO_EXTRAS) {
+
+    a_extras = ck_realloc_block(a_extras, (a_extras_cnt + 1) *
+                                sizeof(struct extra_data));
+
+    a_extras[a_extras_cnt].data = ck_memdup(mem, len);
+    a_extras[a_extras_cnt].len  = len;
+    a_extras_cnt++;
+
+  } else {
+
+    if (UR(2))
+      i = MAX_AUTO_EXTRAS / 2 +
+        UR((MAX_AUTO_EXTRAS + 1) / 2);
+    else
+      i = UR(MAX_AUTO_EXTRAS);
+
+    ck_free(a_extras[i].data);
+
+    a_extras[i].data    = ck_memdup(mem, len);
+    a_extras[i].len     = len;
+    a_extras[i].hit_cnt = 0;
+
+  }
+
+sort_a_extras:
+
+  /* First, sort all auto extras by use count, descending order. */
+
+  qsort(a_extras, a_extras_cnt, sizeof(struct extra_data),
+        compare_extras_use_d);
+
+  /* Then, sort the top USE_AUTO_EXTRAS entries by size. */
+
+  qsort(a_extras, MIN(USE_AUTO_EXTRAS, a_extras_cnt),
+        sizeof(struct extra_data), compare_extras_len);
+
+}
+
+/* Save automatically generated extras. */
+
+static void save_auto(void) {
+
+  u32 i;
+
+  if (!auto_changed) return;
+  auto_changed = 0;
+
+  for (i = 0; i < MIN(USE_AUTO_EXTRAS, a_extras_cnt); i++) {
+
+    u8* fn = alloc_printf("%s/queue/.state/auto_extras/auto_%06u", out_dir, i);
+    s32 fd;
+
+    fd = open(fn, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+
+    if (fd < 0) PFATAL("Unable to create '%s'", fn);
+
+    ck_write(fd, a_extras[i].data, a_extras[i].len, fn);
+
+    close(fd);
+    ck_free(fn);
+
+  }
+
+}
+
+/* Load automatically generated extras. */
+
+static void load_auto(void) {
+
+  u32 i;
+
+  for (i = 0; i < USE_AUTO_EXTRAS; i++) {
+
+    u8  tmp[MAX_AUTO_EXTRA + 1];
+    u8* fn = alloc_printf("%s/.state/auto_extras/auto_%06u", in_dir, i);
+    s32 fd, len;
+
+    fd = open(fn, O_RDONLY, 0600);
+
+    if (fd < 0) {
+
+      if (errno != ENOENT) PFATAL("Unable to open '%s'", fn);
+      ck_free(fn);
+      break;
+
+    }
+
+    /* We read one byte more to cheaply detect tokens that are too
+       long (and skip them). */
+
+    len = read(fd, tmp, MAX_AUTO_EXTRA + 1);
+
+    if (len < 0) PFATAL("Unable to read from '%s'", fn);
+
+    if (len >= MIN_AUTO_EXTRA && len <= MAX_AUTO_EXTRA)
+      maybe_add_auto(tmp, len);
+
+    close(fd);
+    ck_free(fn);
+
+  }
+
+  if (i) OKF("Loaded %u auto-discovered dictionary tokens.", i);
+  else OKF("No auto-generated dictionary tokens to reuse.");
 
 }
 
@@ -1266,428 +1380,12 @@ static void destroy_extras(void) {
 
   ck_free(extras);
 
-}
+  for (i = 0; i < a_extras_cnt; i++)
+    ck_free(a_extras[i].data);
 
-
-
-/* Spin up fork server (instrumented mode only). The idea is explained here:
-
-   http://lcamtuf.blogspot.com/2014/10/fuzzing-binaries-without-execve.html
-
-   In essence, the instrumentation allows us to skip execve(), and just keep
-   cloning a stopped child. So, we just execute once, and then send commands
-   through a pipe. The other part of this logic is in afl-as.h. */
-
-static void init_forkserver(char** argv) {
-
-  static struct itimerval it;
-  int st_pipe[2], ctl_pipe[2];
-  int status;
-  s32 rlen;
-
-  ACTF("Spinning up the fork server...");
-
-  if (pipe(st_pipe) || pipe(ctl_pipe)) PFATAL("pipe() failed");
-
-  forksrv_pid = fork();
-
-  if (forksrv_pid < 0) PFATAL("fork() failed");
-
-  if (!forksrv_pid) {
-
-    struct rlimit r;
-
-    /* Umpf. On OpenBSD, the default fd limit for root users is set to
-       soft 128. Let's try to fix that... */
-
-    if (!getrlimit(RLIMIT_NOFILE, &r) && r.rlim_cur < FORKSRV_FD + 2) {
-
-      r.rlim_cur = FORKSRV_FD + 2;
-      setrlimit(RLIMIT_NOFILE, &r); /* Ignore errors */
-
-    }
-
-    if (mem_limit) {
-
-      r.rlim_max = r.rlim_cur = ((rlim_t)mem_limit) << 20;
-
-#ifdef RLIMIT_AS
-
-      setrlimit(RLIMIT_AS, &r); /* Ignore errors */
-
-#else
-
-      /* This takes care of OpenBSD, which doesn't have RLIMIT_AS, but
-         according to reliable sources, RLIMIT_DATA covers anonymous
-         maps - so we should be getting good protection against OOM bugs. */
-
-      setrlimit(RLIMIT_DATA, &r); /* Ignore errors */
-
-#endif /* ^RLIMIT_AS */
-
-
-    }
-
-    /* Dumping cores is slow and can lead to anomalies if SIGKILL is delivered
-       before the dump is complete. */
-
-    r.rlim_max = r.rlim_cur = 0;
-
-    setrlimit(RLIMIT_CORE, &r); /* Ignore errors */
-
-    /* Isolate the process and configure standard descriptors. If out_file is
-       specified, stdin is /dev/null; otherwise, out_fd is cloned instead. */
-
-    setsid();
-
-    dup2(dev_null_fd, 1);
-    dup2(dev_null_fd, 2);
-
-    if (out_file) {
-
-      dup2(dev_null_fd, 0);
-
-    } else {
-
-      dup2(out_fd, 0);
-      close(out_fd);
-
-    }
-
-    close(dev_null_fd);
-
-    /* Set up control and status pipes, close the unneeded original fds. */
-
-    if (dup2(ctl_pipe[0], FORKSRV_FD) < 0) PFATAL("dup2() failed");
-    if (dup2(st_pipe[1], FORKSRV_FD + 1) < 0) PFATAL("dup2() failed");
-
-    close(ctl_pipe[0]);
-    close(ctl_pipe[1]);
-    close(st_pipe[0]);
-    close(st_pipe[1]);
-
-    /* This should improve performance a bit, since it stops the linker from
-       doing extra work post-fork(). */
-
-    setenv("LD_BIND_NOW", "1", 0);
-
-    /* Set sane defaults for ASAN if nothing else specified. */
-
-    setenv("ASAN_OPTIONS", "abort_on_error=1:"
-                           "detect_leaks=0:"
-                           "allocator_may_return_null=1", 0);
-
-    /* MSAN is tricky, because it doesn't support abort_on_error=1 at this
-       point. So, we do this in a very hacky way. */
-
-    setenv("MSAN_OPTIONS", "exit_code=" STRINGIFY(MSAN_ERROR) ":"
-                           "msan_track_origins=0", 0);
-
-    execv(target_path, argv);
-
-    /* Use a distinctive return value to tell the parent about execv()
-       falling through. This is hackish, but meh... */
-
-    exit(EXEC_FAIL);
-
-  }
-
-  /* Close the unneeded endpoints. */
-
-  close(ctl_pipe[0]);
-  close(st_pipe[1]);
-
-  fsrv_ctl_fd = ctl_pipe[1];
-  fsrv_st_fd  = st_pipe[0];
-
-  /* Wait for the fork server to come up, but don't wait too long. */
-
-  it.it_value.tv_sec = ((exec_tmout * FORK_WAIT_MULT) / 1000);
-  it.it_value.tv_usec = ((exec_tmout * FORK_WAIT_MULT) % 1000) * 1000;
-
-  setitimer(ITIMER_REAL, &it, NULL);
-
-  rlen = read(fsrv_st_fd, &status, 4);
-
-  it.it_value.tv_sec = 0;
-  it.it_value.tv_usec = 0;
-
-  setitimer(ITIMER_REAL, &it, NULL);
-
-  /* If we have a four-byte "hello" message from the server, we're all set.
-     Otherwise, try to figure out what went wrong. */
-
-  if (rlen == 4) {
-    OKF("All right - fork server is up.");
-    return;
-  }
-
-  if (child_timed_out)
-    FATAL("Timeout while initializing fork server (adjusting -t may help)");
-
-  if (waitpid(forksrv_pid, &status, WUNTRACED) <= 0)
-    PFATAL("waitpid() failed");
-
-  if (WIFSIGNALED(status)) {
-
-    if (mem_limit && mem_limit < 500 && uses_asan) {
-
-      SAYF("\n" cLRD "[-] " cRST
-           "Whoops, the target binary crashed suddenly, before receiving any input\n"
-           "    from the fuzzer! Since it seems to be built with ASAN and you have a\n"
-           "    restrictive memory limit configured, this is expected; please read\n"
-           "    %s/notes_for_asan.txt for help.\n", doc_path);
-
-    } else {
-
-      SAYF("\n" cLRD "[-] " cRST
-           "Whoops, the target binary crashed suddenly, before receiving any input\n"
-           "    from the fuzzer! There are several probable explanations:\n\n"
-
-           "    - The current memory limit (%s) is too restrictive, causing the\n"
-           "      target to hit an OOM condition in the dynamic linker. Try bumping up\n"
-           "      the limit with the -m setting in the command line. A simple way confirm\n"
-           "      this diagnosis would be:\n\n"
-
-#ifdef RLIMIT_AS
-           "      ( ulimit -Sv $[%llu << 10]; /path/to/fuzzed_app )\n\n"
-#else
-           "      ( ulimit -Sd $[%llu << 10]; /path/to/fuzzed_app )\n\n"
-#endif /* ^RLIMIT_AS */
-
-           "    - The binary is just buggy and explodes entirely on its own. If so, you\n"
-           "      need to fix the underlying problem or find a better replacement.\n\n"
-
-#ifdef __APPLE__
-
-           "    - On MacOS X, the semantics of fork() syscalls are non-standard and may\n"
-           "      break afl-fuzz performance optimizations when running platform-specific\n"
-           "      binaries. To fix this, set AFL_NO_FORKSRV=1 in the environment.\n\n"
-
-#endif /* __APPLE__ */
-
-           "    - Less likely, there is a horrible bug in the fuzzer. If other options\n"
-           "      fail, poke <lcamtuf@coredump.cx> for troubleshooting tips.\n",
-           DMS(mem_limit << 20), mem_limit - 1);
-
-    }
-
-    FATAL("Fork server crashed with signal %d", WTERMSIG(status));
-
-  }
-
-
-  if (WEXITSTATUS(status) == EXEC_FAIL)
-    FATAL("Unable to execute target application ('%s')", argv[0]);
-
-  if (mem_limit && mem_limit < 500 && uses_asan) {
-
-    SAYF("\n" cLRD "[-] " cRST
-           "Hmm, looks like the target binary terminated before we could complete a\n"
-           "    handshake with the injected code. Since it seems to be built with ASAN and\n"
-           "    you have a restrictive memory limit configured, this is expected; please\n"
-           "    read %s/notes_for_asan.txt for help.\n", doc_path);
-
-  } else {
-
-    SAYF("\n" cLRD "[-] " cRST
-         "Hmm, looks like the target binary terminated before we could complete a\n"
-         "    handshake with the injected code. There are two probable explanations:\n\n"
-
-         "    - The current memory limit (%s) is too restrictive, causing an OOM\n"
-         "      fault in the dynamic linker. This can be fixed with the -m option. A\n"
-         "      simple way to confirm the diagnosis may be:\n\n"
-
-#ifdef RLIMIT_AS
-         "      ( ulimit -Sv $[%llu << 10]; /path/to/fuzzed_app )\n\n"
-#else
-         "      ( ulimit -Sd $[%llu << 10]; /path/to/fuzzed_app )\n\n"
-#endif /* ^RLIMIT_AS */
-
-         "    - Less likely, there is a horrible bug in the fuzzer. If other options\n"
-         "      fail, poke <lcamtuf@coredump.cx> for troubleshooting tips.\n",
-         DMS(mem_limit << 20), mem_limit - 1);
-
-  }
-
-  FATAL("Fork server handshake failed");
+  ck_free(a_extras);
 
 }
-
-
-/* Execute target application, monitoring for timeouts. Return status
-   information. The called program will update trace_bits[]. */
-
-static u8 run_target(char** argv) {
-
-  static struct itimerval it;
-  int status = 0;
-
-  child_timed_out = 0;
-
-  memset(trace_bits, 0, MAP_SIZE);
-
-  /* If we're running in "dumb" mode, we can't rely on the fork server
-     logic compiled into the target program, so we will just keep calling
-     execve(). There is a bit of code duplication between here and 
-     init_forkserver(), but c'est la vie. */
-
-  if (dumb_mode || no_forkserver) {
-
-    child_pid = fork();
-
-    if (child_pid < 0) PFATAL("fork() failed");
-
-    if (!child_pid) {
-
-      struct rlimit r;
-
-      if (mem_limit) {
-
-        r.rlim_max = r.rlim_cur = ((rlim_t)mem_limit) << 20;
-
-#ifdef RLIMIT_AS
-
-        setrlimit(RLIMIT_AS, &r); /* Ignore errors */
-
-#else
-
-        setrlimit(RLIMIT_DATA, &r); /* Ignore errors */
-
-#endif /* ^RLIMIT_AS */
-
-      }
-
-      r.rlim_max = r.rlim_cur = 0;
-
-      setrlimit(RLIMIT_CORE, &r); /* Ignore errors */
-
-      /* Isolate the process and configure standard descriptors. If out_file is
-         specified, stdin is /dev/null; otherwise, out_fd is cloned instead. */
-
-      setsid();
-
-      dup2(dev_null_fd, 1);
-      dup2(dev_null_fd, 2);
-
-      if (out_file) {
-
-        dup2(dev_null_fd, 0);
-
-      } else {
-
-        dup2(out_fd, 0);
-        close(out_fd);
-
-      }
-
-      close(dev_null_fd);
-
-      /* Set sane defaults for ASAN if nothing else specified. */
-
-      setenv("ASAN_OPTIONS", "abort_on_error=1:"
-                             "detect_leaks=0:"
-                             "allocator_may_return_null=1", 0);
-
-      setenv("MSAN_OPTIONS", "exit_code=" STRINGIFY(MSAN_ERROR) ":"
-                             "msan_track_origins=0", 0);
-
-      execv(target_path, argv);
-
-      /* Use a distinctive return value to tell the parent about execv()
-         falling through. */
-
-      exit(EXEC_FAIL);
-
-    }
-
-  } else {
-
-    s32 res;
-
-    /* In non-dumb mode, we have the fork server up and running, so simply
-       tell it to have at it, and then read back PID. */
-
-    if (!forksrv_pid) init_forkserver(argv);
-
-    if ((res = write(fsrv_ctl_fd, &status, 4)) != 4) {
-
-      if (stop_soon) return 0;
-      RPFATAL(res, "Unable to request new process from fork server");
-
-    }
-
-    if ((res = read(fsrv_st_fd, &child_pid, 4)) != 4) {
-
-      if (stop_soon) return 0;
-      RPFATAL(res, "Unable to request new process from fork server");
-
-    }
-
-    if (child_pid <= 0) FATAL("Fork server is misbehaving, sorry");
-
-  }
-
-  /* Configure timeout, as requested by user, then wait for child to terminate. */
-
-  it.it_value.tv_sec = (exec_tmout / 1000);
-  it.it_value.tv_usec = (exec_tmout % 1000) * 1000;
-
-  setitimer(ITIMER_REAL, &it, NULL);
-
-  /* The SIGALRM handler simply kills the child_pid and sets child_timed_out. */
-
-  if (dumb_mode || no_forkserver) {
-
-    if (waitpid(child_pid, &status, WUNTRACED) <= 0) PFATAL("waitpid() failed");
-
-  } else {
-
-    s32 res;
-
-    if ((res = read(fsrv_st_fd, &status, 4)) != 4) {
-
-      if (stop_soon) return 0;
-      RPFATAL(res, "Unable to communicate with fork server");
-
-    }
-
-  }
-
-  child_pid = 0;
-  it.it_value.tv_sec = 0;
-  it.it_value.tv_usec = 0;
-
-  setitimer(ITIMER_REAL, &it, NULL);
-
-  classify_counts((u32*)trace_bits);
-
-  total_execs++;
-
-  /* Report outcome to caller. */
-
-  if (child_timed_out) return FAULT_HANG;
-
-  if (WIFSIGNALED(status) && !stop_soon) {
-    kill_signal = WTERMSIG(status);
-    return FAULT_CRASH;
-  }
-
-  /* A somewhat nasty hack for MSAN, which doesn't support abort_on_error and
-     must use a special exit code. */
-
-  if (uses_asan && WEXITSTATUS(status) == MSAN_ERROR) {
-    kill_signal = 0;
-    return FAULT_CRASH;
-  }
-
-  if ((dumb_mode || no_forkserver) && WEXITSTATUS(status) == EXEC_FAIL)
-    return FAULT_ERROR;
-
-  return FAULT_NONE;
-
-}
-
 
 /* Write modified data to file for testing. If out_file is set, the old file
    is unlinked and a new one is created. Otherwise, out_fd is rewound and
@@ -1765,6 +1463,10 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
   s32 old_sc = stage_cur, old_sm = stage_max, old_tmout = exec_tmout;
   u8* old_sn = stage_name;
 
+#ifdef ERR_THRESHOLD
+  u8  prev_trace_bits[MAP_SIZE];
+#endif
+
   /* Be a bit more generous about timeouts when resuming sessions, or when
      trying to calibrate already-added finds. This helps avoid trouble due
      to intermittent latency. */
@@ -1782,7 +1484,9 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
 
   for (stage_cur = 0; stage_cur < stage_max; stage_cur++) {
 
-    u32 cksum;
+#ifdef ERR_THRESHOLD
+    memcpy(prev_trace_bits, trace_bits, MAP_SIZE);
+#endif
 
     if (!first_run && !(stage_cur % stats_update_freq)) show_stats();
 
@@ -1800,9 +1504,16 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
       goto abort_calibration;
     }
 
-    cksum = hash32(trace_bits, MAP_SIZE, 0xa5b35705);
+    u32 cksum = hash32(trace_bits, MAP_SIZE, HASH_CONST);
 
-    if (q->exec_cksum != cksum) {
+#ifdef ERR_THRESHOLD
+    u32 err = bitmap_diff(trace_bits, prev_trace_bits, MAP_SIZE);
+
+    if (err > ERR_THRESHOLD) {
+#else
+
+    if (q->exec_cksum != cksum) { 
+#endif
 
       u8 hnb = has_new_bits(virgin_bits);
       if (hnb > new_bits) new_bits = hnb;
@@ -1891,6 +1602,7 @@ static void perform_dry_run(char** argv) {
 
   struct queue_entry* q = queue;
   u32 id = 0;
+  u32 cal_failures = 0;
 
   while (q) {
 
@@ -1935,7 +1647,27 @@ static void perform_dry_run(char** argv) {
 
         if (timeout_given) {
 
-          FATAL("Test case '%s' results in a hang (adjusting -t may help)", fn);
+          /* The -t nn+ syntax in the command line sets timeout_given to '2' and
+             instructs afl-fuzz to tolerate but skip queue entries that time
+             out. */
+
+          if (timeout_given == 2) {
+            WARNF("Test case '%s' results in a hang (skipping)", fn);
+            q->cal_failed = CAL_CHANCES;
+            cal_failures++;
+            break;
+          }
+
+          SAYF("\n" cLRD "[-] " cRST
+               "The program took more than %u ms to process one of the initial test cases.\n"
+               "    Usually, the right thing to do is to relax the -t option - or to delete it\n"
+               "    altogether and allow the fuzzer to auto-calibrate. That said, if you know\n"
+               "    what you are doing and want to simply skip the unruly test cases, append\n"
+               "    '+' at the end of the value passed to -t ('-t %u+').\n", exec_tmout,
+               exec_tmout);
+
+          FATAL("Test case '%s' results in a hang", fn);
+	  
 
         } else {
 
@@ -2010,6 +1742,19 @@ static void perform_dry_run(char** argv) {
 
     q = q->next;
     id++;
+
+  }
+
+  if (cal_failures) {
+
+    if (cal_failures == queued_paths)
+      FATAL("All test cases time out, giving up!");
+
+    WARNF("Skipped %u test cases (%0.02f%%) due to timeouts.", cal_failures,
+          ((double)cal_failures) * 100 / queued_paths);
+
+    if (cal_failures * 5 > queued_paths)
+      WARNF(cLRD "High percentage of rejected test cases, check settings!");
 
   }
 
@@ -2230,7 +1975,7 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
       queued_with_cov++;
     }
 
-    queue_top->exec_cksum = hash32(trace_bits, MAP_SIZE, 0xa5b35705);
+    queue_top->exec_cksum = hash32(trace_bits, MAP_SIZE, HASH_CONST);
 
     /* Try to calibrate inline; this also calls update_bitmap_score() when
        successful. */
@@ -2264,7 +2009,11 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
 
       if (!dumb_mode) {
 
+#ifdef __x86_64__
+        simplify_trace((u64*)trace_bits);
+#else
         simplify_trace((u32*)trace_bits);
+#endif /* ^__x86_64__ */
 
         if (!has_new_bits(virgin_hang)) return keeping;
 
@@ -2290,7 +2039,11 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
 
       if (!dumb_mode) {
 
+#ifdef __x86_64__
+        simplify_trace((u64*)trace_bits);
+#else
         simplify_trace((u32*)trace_bits);
+#endif /* ^__x86_64__ */
 
         if (!has_new_bits(virgin_crash)) return keeping;
 
@@ -2327,12 +2080,46 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
 
 }
 
+/* When resuming, try to find the queue position to start from. This makes sense
+   only when resuming, and when we can find the original fuzzer_stats. */
+
+static u32 find_start_position(void) {
+
+  static u8 tmp[4096]; /* Ought to be enough for anybody. */
+
+  u8  *fn, *off;
+  s32 fd, i;
+  u32 ret;
+
+  if (!resuming_fuzz) return 0;
+
+  if (in_place_resume) fn = alloc_printf("%s/fuzzer_stats", out_dir);
+  else fn = alloc_printf("%s/../fuzzer_stats", in_dir);
+
+  fd = open(fn, O_RDONLY);
+  ck_free(fn);
+
+  if (fd < 0) return 0;
+
+  i = read(fd, tmp, sizeof(tmp) - 1); (void)i; /* Ignore errors */
+  close(fd);
+
+  off = strstr(tmp, "cur_path       : ");
+  if (!off) return 0;
+
+  ret = atoi(off + 17);
+  if (ret > queued_paths) ret = 0;
+  return ret;
+
+}
 
 /* Update stats file for unattended monitoring. */
 
 static void write_stats_file(double bitmap_cvg, double eps) {
 
-  u8* fn = alloc_printf("%s/fuzzer_stats", out_dir);
+  static double last_bcvg, last_eps;
+
+  u8 *fn = alloc_printf("%s/fuzzer_stats", out_dir);
   s32 fd;
   FILE* f;
 
@@ -2345,6 +2132,17 @@ static void write_stats_file(double bitmap_cvg, double eps) {
   f = fdopen(fd, "w");
 
   if (!f) PFATAL("fdopen() failed");
+
+  /* Keep last values in case we're called from another context
+     where exec/sec stats and such are not readily available. */
+
+  if (!bitmap_cvg && !eps) {
+    bitmap_cvg = last_bcvg;
+    eps        = last_eps;
+  } else {
+    last_bcvg = bitmap_cvg;
+    last_eps  = eps;
+  }
 
   fprintf(f, "start_time     : %llu\n"
              "last_update    : %llu\n"
@@ -2365,8 +2163,8 @@ static void write_stats_file(double bitmap_cvg, double eps) {
              "unique_hangs   : %llu\n"
              "afl_banner     : %s\n",
              start_time / 1000, get_cur_time() / 1000, getpid(),
-             queue_cycle - 1, total_execs, eps, queued_paths,
-             queued_discovered, queued_imported, max_depth,
+             queue_cycle ? (queue_cycle - 1) : 0, total_execs, eps, 
+             queued_paths, queued_discovered, queued_imported, max_depth,
              current_entry, pending_favored, pending_not_fuzzed,
              queued_variable, bitmap_cvg, unique_crashes, unique_hangs,
              use_banner); /* ignore errors */
@@ -2510,6 +2308,10 @@ static void nuke_resume_dir(void) {
   if (delete_files(fn, "id:")) goto dir_cleanup_failed;
   ck_free(fn);
 
+  fn = alloc_printf("%s/_resume/.state/auto_extras", out_dir);
+  if (delete_files(fn, "auto_")) goto dir_cleanup_failed;
+  ck_free(fn);
+
   fn = alloc_printf("%s/_resume/.state/redundant_edges", out_dir);
   if (delete_files(fn, "id:")) goto dir_cleanup_failed;
   ck_free(fn);
@@ -2627,10 +2429,14 @@ static void maybe_delete_out_dir(void) {
   if (delete_files(fn, NULL)) goto dir_cleanup_failed;
   ck_free(fn);
 
-  // Next, we need to clean up <out_dir>/queue/.state/ subdirectories:
+  /* Next, we need to clean up <out_dir>/queue/.state/ subdirectories: */
 
   fn = alloc_printf("%s/queue/.state/deterministic_done", out_dir);
   if (delete_files(fn, "id:")) goto dir_cleanup_failed;
+  ck_free(fn);
+
+  fn = alloc_printf("%s/queue/.state/auto_extras", out_dir);
+  if (delete_files(fn, "auto_")) goto dir_cleanup_failed;
   ck_free(fn);
 
   fn = alloc_printf("%s/queue/.state/redundant_edges", out_dir);
@@ -2711,9 +2517,11 @@ static void maybe_delete_out_dir(void) {
   if (unlink(fn) && errno != ENOENT) goto dir_cleanup_failed;
   ck_free(fn);
 
-  fn = alloc_printf("%s/fuzzer_stats", out_dir);
-  if (unlink(fn) && errno != ENOENT) goto dir_cleanup_failed;
-  ck_free(fn);
+  if (!in_place_resume) {
+    fn = alloc_printf("%s/fuzzer_stats", out_dir);
+    if (unlink(fn) && errno != ENOENT) goto dir_cleanup_failed;
+    ck_free(fn);
+  }
 
   fn = alloc_printf("%s/plot_data", out_dir);
   if (unlink(fn) && errno != ENOENT) goto dir_cleanup_failed;
@@ -2793,12 +2601,14 @@ static void show_stats(void) {
   t_bytes = count_non_255_bytes(virgin_bits);
   t_byte_ratio = ((double)t_bytes * 100) / MAP_SIZE;
 
-  /* Roughly every minute, update fuzzer stats. */
+  /* Roughly every minute, update fuzzer stats and save auto tokens. */
 
   if (cur_ms - last_stats_ms > STATS_UPDATE_SEC * 1000) {
 
     last_stats_ms = cur_ms;
     write_stats_file(t_byte_ratio, avg_exec);
+    save_auto();
+    write_bitmap();
 
   }
 
@@ -2854,8 +2664,8 @@ static void show_stats(void) {
 
   /* Lord, forgive me this. */
 
-  SAYF(bSTG bLT bH bSTOP cCYA " process timing " bSTG bH30 bH5 bH2 bHB bH
-       bSTOP cCYA " overall results " bSTG bH5 bRT "\n");
+  SAYF(SET_G1 bSTG bLT bH bSTOP cCYA " process timing " bSTG bH30 bH5 bH2 bHB
+       bH bSTOP cCYA " overall results " bSTG bH5 bRT "\n");
 
   if (dumb_mode) {
 
@@ -3015,41 +2825,37 @@ static void show_stats(void) {
   SAYF(bVR bH cCYA bSTOP " fuzzing strategy yields " bSTG bH10 bH bHT bH10
        bH5 bHB bH bSTOP cCYA " path geometry " bSTG bH5 bH2 bH bVL "\n");
 
+  sprintf(tmp, "%s/%s",
+          DI(stage_finds[STAGE_COMMENT]), DI(stage_cycles[STAGE_COMMENT]));
+
+  SAYF(bV bSTOP "    comments : " cNOR "%-37s " bSTG bV bSTOP "    levels : "
+       cNOR "%-10s " bSTG bV "\n", tmp, DI(max_depth));
+
   sprintf(tmp, "%s/%s, %s/%s, %s/%s",
           DI(stage_finds[STAGE_FLIP1]), DI(stage_cycles[STAGE_FLIP1]),
           DI(stage_finds[STAGE_FLIP4]), DI(stage_cycles[STAGE_FLIP2]),
           DI(stage_finds[STAGE_FLIP4]), DI(stage_cycles[STAGE_FLIP4]));
 
-  SAYF(bV bSTOP "   bit flips : " cNOR "%-37s " bSTG bV bSTOP "    levels : "
-       cNOR "%-10s " bSTG bV "\n", tmp, DI(max_depth));
+  SAYF(bV bSTOP "   bit flips : " cNOR "%-37s " bSTG bV bSTOP "   pending : "
+       cNOR "%-10s " bSTG bV "\n", tmp, DI(pending_not_fuzzed));
 
   sprintf(tmp, "%s/%s, %s/%s, %s/%s",
           DI(stage_finds[STAGE_FLIP8]), DI(stage_cycles[STAGE_FLIP8]),
           DI(stage_finds[STAGE_FLIP16]), DI(stage_cycles[STAGE_FLIP16]),
           DI(stage_finds[STAGE_FLIP32]), DI(stage_cycles[STAGE_FLIP32]));
 
-  SAYF(bV bSTOP "  byte flips : " cNOR "%-37s " bSTG bV bSTOP "   pending : "
-       cNOR "%-10s " bSTG bV "\n", tmp, DI(pending_not_fuzzed));
-
-  sprintf(tmp, "%s/%s, %s/%s, %s/%s",
-          DI(stage_finds[STAGE_ARITH8]), DI(stage_cycles[STAGE_ARITH8]),
-          DI(stage_finds[STAGE_ARITH16]), DI(stage_cycles[STAGE_ARITH16]),
-          DI(stage_finds[STAGE_ARITH32]), DI(stage_cycles[STAGE_ARITH32]));
-
-  SAYF(bV bSTOP " arithmetics : " cNOR "%-37s " bSTG bV bSTOP "  pend fav : "
+  SAYF(bV bSTOP "  byte flips : " cNOR "%-37s " bSTG bV bSTOP "  pend fav : "
        cNOR "%-10s " bSTG bV "\n", tmp, DI(pending_favored));
 
   sprintf(tmp, "%s/%s, %s/%s, %s/%s",
-          DI(stage_finds[STAGE_INTEREST8]), DI(stage_cycles[STAGE_INTEREST8]),
-          DI(stage_finds[STAGE_INTEREST16]), DI(stage_cycles[STAGE_INTEREST16]),
-          DI(stage_finds[STAGE_INTEREST32]), DI(stage_cycles[STAGE_INTEREST32]));
+          DI(stage_finds[STAGE_EXTRAS_UO]), DI(stage_cycles[STAGE_EXTRAS_UO]),
+          DI(stage_finds[STAGE_EXTRAS_UI]), DI(stage_cycles[STAGE_EXTRAS_UI]),
+          DI(stage_finds[STAGE_EXTRAS_AO]), DI(stage_cycles[STAGE_EXTRAS_AO]));
 
-  SAYF(bV bSTOP "  known ints : " cNOR "%-37s " bSTG bV bSTOP " own finds : "
-       cNOR "%-10s " bSTG bV "\n", tmp, DI(queued_discovered));
+  SAYF(bV bSTOP "  dictionary : " cNOR "%-37s " bSTG bV bSTOP
+       " own finds : " cNOR "%-10s " bSTG bV "\n", tmp, DI(queued_discovered));
 
-
-  sprintf(tmp, "%s/%s, %s/%s, %s/%s",
-          DI(stage_finds[STAGE_EXTRAS]), DI(stage_cycles[STAGE_EXTRAS]),
+  sprintf(tmp, "%s/%s, %s/%s",
           DI(stage_finds[STAGE_HAVOC]), DI(stage_cycles[STAGE_HAVOC]),
           DI(stage_finds[STAGE_SPLICE]), DI(stage_cycles[STAGE_SPLICE]));
 
@@ -3065,14 +2871,13 @@ static void show_stats(void) {
     sprintf(tmp, "%s/%s (%0.02f%% gain)", DMS(bytes_trim_in - bytes_trim_out),
             DI(trim_execs), ((double)(bytes_trim_in - bytes_trim_out)) * 100
             / bytes_trim_in);
-
   }
 
   SAYF(bV bSTOP "        trim : " cNOR "%-37s " bSTG bV bSTOP 
        "  variable : %s%-10s " bSTG bV "\n", tmp, queued_variable ? cLRD : cNOR,
        DI(queued_variable));
 
-  SAYF(bLB bH30 bH20 bH2 bH bHT bH20 bH2 bH2 bRB bSTOP cRST "\n");
+  SAYF(bLB bH30 bH20 bH2 bH bHT bH20 bH2 bH2 bRB bSTOP cRST RESET_G1 "\n");
 
   /* Provide some CPU utilization stats. */
 
@@ -3090,7 +2895,7 @@ static void show_stats(void) {
 
     /* If we're clearly oversubscribed, use red. */
 
-    if (cur_utilization >= 150) cpu_color = cLRD;
+    if (!no_cpu_meter_red && cur_utilization >= 150) cpu_color = cLRD;
 
     SAYF(SP20 SP20 SP20 SP5 cGRA "    [cpu:%s%3u%%" cGRA "]\r" cRST,
          cpu_color, cur_utilization < 999 ? cur_utilization : 999);
@@ -3105,7 +2910,8 @@ static void show_stats(void) {
 
 
 /* Display quick statistics at the end of processing the input directory,
-   plus a bunch of warnings. Nothing fancy. */
+   plus a bunch of warnings. Some calibration stuff also ended up here,
+   along with several hardcoded constants. Maybe clean up eventually. */
 
 static void show_init_stats(void) {
 
@@ -3137,6 +2943,13 @@ static void show_init_stats(void) {
     WARNF(cLRD "The target binary is pretty slow! See %s/perf_tips.txt.",
           doc_path);
 
+  /* Let's keep things moving when using -d against slow binaries. */
+
+  if (avg_us > 50000) havoc_div = 10;    /* 0-9 execs/sec    */
+  else if (avg_us > 20000) havoc_div = 5; /* 10-49 execs/sec  */
+  else if (avg_us > 10000) havoc_div = 2; /* 50-100 execs/sec */
+
+
   if (!resuming_fuzz) {
 
     if (max_len > 50 * 1024)
@@ -3154,7 +2967,6 @@ static void show_init_stats(void) {
     else if (queued_paths > 20)
       WARNF("You have lots of input files; try starting small.");
 
-
   }
 
   OKF("Here are some useful stats:\n\n"
@@ -3169,9 +2981,15 @@ static void show_init_stats(void) {
   if (!timeout_given) {
 
     /* Figure out the appropriate timeout. The basic idea is: 5x average or
-       1x max, plus 50 ms, rounded down to 50 ms and capped at 1 second. */
+       1x max, plus 50 ms, rounded down to 50 ms and capped at 1 second. 
 
-    exec_tmout = 50 + MAX(avg_us * 5 / 1000, max_us / 1000);
+       If the program is slow (>20 ms), we use 3x average, rather than 5x. */
+
+    if (avg_us > 20000)
+      exec_tmout = 50 + MAX(avg_us * 3 / 1000, max_us / 1000);
+    else 
+      exec_tmout = 50 + MAX(avg_us * 5 / 1000, max_us / 1000);
+
     exec_tmout = exec_tmout / 50 * 50;
 
     if (exec_tmout > EXEC_TIMEOUT) exec_tmout = EXEC_TIMEOUT;
@@ -3212,6 +3030,9 @@ static u8 trim_case(char** argv, struct queue_entry* q, u8* in_buf) {
   u32 trim_exec = 0;
   u32 remove_len;
   u32 len_p2;
+#ifdef ERR_THRESHOLD
+  u8  prev_trace_bits[MAP_SIZE];
+#endif
 
   if (q->len < 5 || q->var_behavior) return 0;
 
@@ -3238,8 +3059,11 @@ static u8 trim_case(char** argv, struct queue_entry* q, u8* in_buf) {
 
     while (remove_pos < q->len) {
 
+#ifdef ERR_THRESHOLD
+      memcpy(prev_trace_bits, trace_bits, MAP_SIZE);
+#endif
+
       u32 trim_avail = MIN(remove_len, q->len - remove_pos);
-      u32 cksum;
 
       write_with_gap(in_buf, q->len, remove_pos, trim_avail);
 
@@ -3250,15 +3074,20 @@ static u8 trim_case(char** argv, struct queue_entry* q, u8* in_buf) {
 
       /* Note that we don't keep track of crashes or hangs here; maybe TODO? */
 
-      cksum = hash32(trace_bits, MAP_SIZE, 0xa5b35705);
-
       /* If the deletion had no impact on the trace, make it permanent. This
          isn't perfect for variable-path inputs, but we're just making a
          best-effort pass, so it's not a big deal if we end up with false
          negatives every now and then. */
 
-      if (cksum == q->exec_cksum) {
+#ifdef ERR_THRESHOLD
+      u32 err = bitmap_diff(trace_bits, prev_trace_bits, MAP_SIZE);
 
+      if (err > ERR_THRESHOLD) {
+#else
+      u32 cksum = hash32(trace_bits, MAP_SIZE, HASH_CONST);
+
+      if (cksum == q->exec_cksum) {
+#endif
         u32 move_tail = q->len - remove_pos - trim_avail;
 
         q->len -= trim_avail;
@@ -3388,7 +3217,8 @@ static u32 choose_block_len(u32 limit) {
 
 
 /* Calculate case desirability score to adjust the length of havoc fuzzing.
-   A helper function for fuzz_one(). */
+   A helper function for fuzz_one(). Maybe some of these constants should
+   go into config.h */
 
 static u32 calculate_score(struct queue_entry* q) {
 
@@ -3466,7 +3296,7 @@ static u8 fuzz_one(char** argv) {
   s32 len, fd, temp_len;
   s32 i, j;
 
-  u8  *in_buf, *out_buf, *orig_in;
+  u8  *in_buf, *out_buf, *orig_in, *ex_tmp;
 
   u64 havoc_queued;
   u64 orig_hit_cnt, new_hit_cnt;
@@ -3475,6 +3305,18 @@ static u8 fuzz_one(char** argv) {
   u32 perf_score = 100;
 
   u8  ret_val = 1;
+
+  u8  a_collect[MAX_AUTO_EXTRA];
+  u32 a_len = 0;
+
+#if defined(ERR_THRESHOLD) || defined(AUTO_EXTRA_THRESH)
+  u8  prev_trace_bits[MAP_SIZE];
+  u8  org_trace_bits[MAP_SIZE];
+#endif
+
+#if !defined(ERR_THRESHOLD)
+  u32 prev_cksum;
+#endif
 
 #ifdef IGNORE_FINDS
 
@@ -3547,12 +3389,15 @@ static u8 fuzz_one(char** argv) {
 
   if (queue_cur->cal_failed) {
 
-    u8 res;
+    u8 res = FAULT_HANG;
 
-    res = calibrate_case(argv, queue_cur, in_buf, queue_cycle - 1, 0);
+    if (queue_cur->cal_failed < CAL_CHANCES) {
 
-    if (res == FAULT_ERROR)
-      FATAL("Unable to execute target application");
+      res = calibrate_case(argv, queue_cur, in_buf, queue_cycle - 1, 0);
+
+      if (res == FAULT_ERROR)
+        FATAL("Unable to execute target application");
+    }
 
     if (stop_soon || res != crash_mode) {
       cur_skipped_paths++;
@@ -3600,9 +3445,9 @@ static u8 fuzz_one(char** argv) {
   if (skip_deterministic || queue_cur->was_fuzzed || queue_cur->passed_det)
     goto havoc_stage;
 
-  /******************
-   * SIMPLE BITFLIP *
-   ******************/
+  /*********************************************
+   * SIMPLE BITFLIP (+dictionary construction) *
+   *********************************************/
 
 #define FLIP_BIT(_ar, _b) do { \
     u8* _arf = (u8*)(_ar); \
@@ -3612,13 +3457,22 @@ static u8 fuzz_one(char** argv) {
 
   /* Single walking bit. */
 
-  stage_name  = "bitflip 1/1";
   stage_short = "flip1";
   stage_max   = len << 3;
+  stage_name  = "bitflip 1/1";
 
   stage_val_type = STAGE_VAL_NONE;
 
   orig_hit_cnt = queued_paths + unique_crashes;
+
+#if defined(ERR_THRESHOLD) || defined(AUTO_EXTRA_THRESH)
+  memcpy(prev_trace_bits, trace_bits, MAP_SIZE);
+  memcpy(org_trace_bits, trace_bits, MAP_SIZE);
+#endif
+
+#if !defined(ERR_THRESHOLD)
+  prev_cksum = queue_cur->exec_cksum;
+#endif
 
   for (stage_cur = 0; stage_cur < stage_max; stage_cur++) {
 
@@ -3630,12 +3484,97 @@ static u8 fuzz_one(char** argv) {
 
     FLIP_BIT(out_buf, stage_cur);
 
+    /* While flipping the least significant bit in every byte, pull of an extra
+       trick to detect possible syntax tokens. In essence, the idea is that if
+       you have a binary blob like this:
+
+       xxxxxxxxIHDRxxxxxxxx
+
+       ...and changing the leading and trailing bytes causes variable or no
+       changes in program flow, but touching any character in the "IHDR" string
+       always produces the same, distinctive path, it's highly likely that
+       "IHDR" is an atomically-checked magic value of special significance to
+       the fuzzed format.
+
+       We do this here, rather than as a separate stage, because it's a nice
+       way to keep the operation approximately "free" (i.e., no extra execs).
+
+       Empirically, performing the check when flipping the least significant bit
+       is advantageous, compared to doing it at the time of more disruptive
+       changes, where the program flow may be affected in more violent ways.
+
+       The caveat is that we won't generate dictionaries in the -d mode or -S
+       mode - but that's probably a fair trade-off.
+
+      */
+    if ((stage_cur & 7) == 7) {
+
+#ifdef ERR_THRESHOLD
+      u32 err = bitmap_diff(trace_bits, prev_trace_bits, MAP_SIZE);
+
+      if (stage_cur == stage_max - 1 && err < ERR_THRESHOLD) {
+#else
+      u32 cksum = hash32(trace_bits, MAP_SIZE, HASH_CONST);
+
+      if (stage_cur == stage_max - 1 && cksum == prev_cksum) {
+#endif
+
+        /* If at end of file and we are still collecting a string, grab the
+           final character and force output. */
+
+        if (a_len < MAX_AUTO_EXTRA) a_collect[a_len] = out_buf[stage_cur >> 3];
+        a_len++;
+
+        if (a_len >= MIN_AUTO_EXTRA && a_len <= MAX_AUTO_EXTRA)
+          maybe_add_auto(a_collect, a_len);
+
+#ifdef ERR_THRESHOLD
+      } else if (err >= ERR_THRESHOLD) {
+#else
+      } else if (cksum != prev_cksum) {
+#endif
+
+        /* Otherwise, if the checksum has changed, see if we have something
+           worthwhile queued up, and collect that if the answer is yes. */
+
+        if (a_len >= MIN_AUTO_EXTRA && a_len <= MAX_AUTO_EXTRA)
+          maybe_add_auto(a_collect, a_len);
+
+        a_len = 0;
+#ifdef ERR_THRESHOLD
+        memcpy(prev_trace_bits, trace_bits, MAP_SIZE);
+#else
+        prev_cksum = cksum;
+#endif
+
+      }
+
+      /* Continue collecting string, but only if the bit flip actually made
+         any difference - we don't want no-op tokens. */
+
+#ifdef ERR_THRESHOLD
+      err = bitmap_diff(trace_bits, org_trace_bits, MAP_SIZE);
+
+      if (err >= ERR_THRESHOLD) {
+#else
+      if (cksum != queue_cur->exec_cksum) {
+#endif
+
+        if (a_len < MAX_AUTO_EXTRA) a_collect[a_len] = out_buf[stage_cur >> 3];
+        a_len++;
+
+      }
+
+    }
+
   }
 
   new_hit_cnt = queued_paths + unique_crashes;
 
   stage_finds[STAGE_FLIP1]  += new_hit_cnt - orig_hit_cnt;
   stage_cycles[STAGE_FLIP1] += stage_max;
+
+  if (queue_cur->passed_det) goto havoc_stage;
 
   /* Two walking bits. */
 
@@ -3776,376 +3715,119 @@ static u8 fuzz_one(char** argv) {
 
 skip_bitflip:
 
-  /**********************
-   * ARITHMETIC INC/DEC *
-   **********************/
+  /*********************************************
+   * COMMENT METHOD (dictionary construction) *
+   *********************************************/
 
-  /* 8-bit arithmetics. */
+  stage_name  = "comment 1/1";
+  stage_short = "comment";
+  stage_max   = len * (len + 1) / 2;
 
-  stage_name  = "arith 8/8";
-  stage_short = "arith8";
-  stage_cur   = 0;
-  stage_max   = 2 * len * ARITH_MAX;
+  stage_val_type = STAGE_VAL_NONE;
 
-  stage_val_type = STAGE_VAL_LE;
+  orig_hit_cnt = queued_paths + unique_crashes;
 
-  orig_hit_cnt = new_hit_cnt;
+#if defined(ERR_THRESHOLD) || defined(AUTO_EXTRA_THRESH)
+  memcpy(prev_trace_bits, org_trace_bits, MAP_SIZE);
+#else
+  prev_cksum = queue_cur->exec_cksum;
+#endif
+
+  ex_tmp = ck_alloc(len + 8);
 
   for (i = 0; i < len; i++) {
 
     stage_cur_byte = i;
-
-    for (j = 1; j <= ARITH_MAX; j++) {
-
-      stage_cur_val = j;
-      out_buf[i] += j;
-
-      if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
-      stage_cur++;
-
-      stage_cur_val = -j;
-      out_buf[i] -= 2 * j;
-
-      if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
-      stage_cur++;
-
-      out_buf[i] += j;
-
-    }
-
-  }
-
-  new_hit_cnt = queued_paths + unique_crashes;
-
-  stage_finds[STAGE_ARITH8]  += new_hit_cnt - orig_hit_cnt;
-  stage_cycles[STAGE_ARITH8] += stage_max;
-
-  /* 16-bit arithmetics, both endians. */
-
-  if (len < 2) goto skip_arith;
-
-  stage_name  = "arith 16/8";
-  stage_short = "arith16";
-  stage_cur   = 0;
-  stage_max   = 4 * (len - 1) * ARITH_MAX;
-
-  orig_hit_cnt = new_hit_cnt;
-
-  for (i = 0; i < len - 1; i++) {
-
-    u16 orig = *(u16*)(out_buf + i);
-
-    stage_cur_byte = i;
-
-    for (j = 1; j <= ARITH_MAX; j++) {
-
-      /* Try little endian addition and subtraction first. Do it only
-         if the operation would affect more than one byte (hence the 
-         & 0xff overflow checks). */
-
-      stage_val_type = STAGE_VAL_LE; 
-
-      if ((orig & 0xff) + j > 0xff) {
-
-        stage_cur_val = j;
-        *(u16*)(out_buf + i) = orig + j;
-
-        if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
-        stage_cur++;
- 
-      } else stage_max--;
-
-      if ((orig & 0xff) < j) {
-
-        stage_cur_val = -j;
-        *(u16*)(out_buf + i) = orig - j;
-
-        if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
-        stage_cur++;
-
-      } else stage_max--;
-
-      /* Big endian comes next. Same deal. */
-
-      stage_val_type = STAGE_VAL_BE;
-
-      if ((orig >> 8) + j > 0xff) {
-
-        stage_cur_val = j;
-        *(u16*)(out_buf + i) = SWAP16(SWAP16(orig) + j);
-
-        if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
-        stage_cur++;
-
-      } else stage_max--;
-
-      if ((orig >> 8) < j) {
-
-        stage_cur_val = -j;
-        *(u16*)(out_buf + i) = SWAP16(SWAP16(orig) - j);
-
-        if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
-        stage_cur++;
-
-      } else stage_max--;
-
-      *(u16*)(out_buf + i) = orig;
-
-    }
-
-  }
-
-  new_hit_cnt = queued_paths + unique_crashes;
-
-  stage_finds[STAGE_ARITH16]  += new_hit_cnt - orig_hit_cnt;
-  stage_cycles[STAGE_ARITH16] += stage_max;
-
-  /* 32-bit arithmetics, both endians. */
-
-  if (len < 4) goto skip_arith;
-
-  stage_name  = "arith 32/8";
-  stage_short = "arith32";
-  stage_cur   = 0;
-  stage_max   = 4 * (len - 3) * ARITH_MAX;
-
-  orig_hit_cnt = new_hit_cnt;
-
-  for (i = 0; i < len - 3; i++) {
-
-    u32 orig = *(u32*)(out_buf + i);
-
-    stage_cur_byte = i;
-
-    for (j = 1; j <= ARITH_MAX; j++) {
-
-      /* Little endian first. Same deal as with 16-bit: we only want to
-         try if the operation would have effect on more than two bytes. */
-
-      stage_val_type = STAGE_VAL_LE; 
-
-      if ((orig & 0xffff) + j > 0xffff) {
-
-        stage_cur_val = j;
-        *(u32*)(out_buf + i) = orig + j;
-
-        if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
-        stage_cur++;
-
-      } else stage_max--;
-
-      if ((orig & 0xffff) < j) {
-
-        stage_cur_val = -j;
-        *(u32*)(out_buf + i) = orig - j;
-
-        if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
-        stage_cur++;
-
-      } else stage_max--;
-
-      /* Big endian next. */
-
-      stage_val_type = STAGE_VAL_BE;
- 
-      if ((SWAP32(orig) & 0xffff) + j > 0xffff) {
-
-        stage_cur_val = j;
-        *(u32*)(out_buf + i) = SWAP32(SWAP32(orig) + j);
-
-        if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
-        stage_cur++;
-
-      } else stage_max--;
-
-      if ((SWAP32(orig) & 0xffff) < j) {
-
-        stage_cur_val = -j;
-        *(u32*)(out_buf + i) = SWAP32(SWAP32(orig) - j);
-
-        if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
-        stage_cur++;
-
-      } else stage_max--;
-
-      *(u32*)(out_buf + i) = orig;
-
-    }
-
-  }
-
-  new_hit_cnt = queued_paths + unique_crashes;
-
-  stage_finds[STAGE_ARITH32]  += new_hit_cnt - orig_hit_cnt;
-  stage_cycles[STAGE_ARITH32] += stage_max;
-
-skip_arith:
-
-  /**********************
-   * INTERESTING VALUES *
-   **********************/
-
-  stage_name  = "interest 8/8";
-  stage_short = "int8";
-  stage_cur   = 0;
-  stage_max   = len * sizeof(interesting_8);
-
-  stage_val_type = STAGE_VAL_LE;
-
-  orig_hit_cnt = new_hit_cnt;
-
-  /* Setting 8-bit integers. */
-
-  for (i = 0; i < len; i++) {
-
-    u8 orig = out_buf[i];
-
-    stage_cur_byte = i;
-
-    for (j = 0; j < sizeof(interesting_8); j++) {
-
-      if (interesting_8[j] == orig) {
-        stage_max--;
-        continue;
+    a_len = 0;
+
+    for (j = i+1; j <= len; j++) {
+
+      /* Insert comment1 start */
+      memcpy(ex_tmp, "/*", 2);
+      /* Copy front */
+      memcpy(ex_tmp + 2, out_buf, i);
+      /* Insert comment1 end */
+      memcpy(ex_tmp + i + 2, "*/", 2);
+
+      /* Copy body */
+      memcpy(ex_tmp + i + 4, out_buf + i, j - i);
+
+      /* Insert comment2 start */
+      memcpy(ex_tmp + j + 4, "/*", 2);
+      /* Copy tail */
+      memcpy(ex_tmp + j + 6, out_buf + j, len - j);
+      /* Insert comment2 end */
+      memcpy(ex_tmp + len + 6, "*/", 2);
+
+      if (common_fuzz_stuff(argv, ex_tmp, len + 8)) {
+        ck_free(ex_tmp);
+        goto abandon_entry;
       }
 
-      stage_cur_val = interesting_8[j];
-      out_buf[i] = interesting_8[j];
-
-      if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
-
-      out_buf[i] = orig;
       stage_cur++;
 
+#if defined(ERR_THRESHOLD)
+      u32 err = bitmap_diff(trace_bits, prev_trace_bits, MAP_SIZE);
+
+      if (err > ERR_THRESHOLD) {
+#elif defined(AUTO_EXTRA_THRESH)
+      u32 err = bitmap_diff(trace_bits, prev_trace_bits, MAP_SIZE);
+
+      if (err > AUTO_EXTRA_THRESH) {
+#else
+      u32 cksum = hash32(trace_bits, MAP_SIZE, 0xa5b35705);
+
+      if (cksum != prev_cksum) {
+#endif
+        a_collect[a_len++] = out_buf[j-1];
+
+        if (a_len >= MIN_AUTO_EXTRA && a_len <= MAX_AUTO_EXTRA)
+	  maybe_add_auto(a_collect, a_len);
+
+	a_len = 0;
+#if defined(ERR_THRESHOLD) || defined(AUTO_EXTRA_THRESH)
+        memcpy(prev_trace_bits, trace_bits, MAP_SIZE);
+#else
+	prev_cksum = cksum;
+#endif
+      }
+
+#if defined(AUTO_EXTRA_THRESH)
+      err = bitmap_diff(trace_bits, org_trace_bits, MAP_SIZE);
+      if (err > AUTO_EXTRA_THRESH && a_len < MAX_AUTO_EXTRA)
+        a_collect[a_len++] = out_buf[j-1];
+#elif defined(ERR_THRESHOLD)
+      err = bitmap_diff(trace_bits, org_trace_bits, MAP_SIZE);
+      if (err > ERR_THRESHOLD && a_len < MAX_AUTO_EXTRA)
+        a_collect[a_len++] = out_buf[j-1];
+#else
+      if (cksum != queue_cur->exec_cksum && a_len < MAX_AUTO_EXTRA)
+        a_collect[a_len++] = out_buf[j-1];
+#endif
     }
 
   }
 
-  new_hit_cnt = queued_paths + unique_crashes;
-
-  stage_finds[STAGE_INTEREST8]  += new_hit_cnt - orig_hit_cnt;
-  stage_cycles[STAGE_INTEREST8] += stage_max;
-
-  /* Setting 16-bit integers, both endians. */
-
-  if (len < 2) goto skip_interest;
-
-  stage_name  = "interest 16/8";
-  stage_short = "int16";
-  stage_cur   = 0;
-  stage_max   = 2 * (len - 1) * (sizeof(interesting_16) >> 1);
-
-  orig_hit_cnt = new_hit_cnt;
-
-  for (i = 0; i < len - 1; i++) {
-
-    u16 orig = *(u16*)(out_buf + i);
-
-    stage_cur_byte = i;
-
-    for (j = 0; j < sizeof(interesting_16) / 2; j++) {
-
-      stage_cur_val = interesting_16[j];
-
-      if (interesting_16[j] != orig) {
-
-        stage_val_type = STAGE_VAL_LE;
-
-        *(u16*)(out_buf + i) = interesting_16[j];
-
-        if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
-        stage_cur++;
-
-      } else stage_max--;
-
-      if (SWAP16(interesting_16[j]) != interesting_16[j] && 
-          SWAP16(interesting_16[j]) != orig) {
-
-        stage_val_type = STAGE_VAL_BE;
-
-        *(u16*)(out_buf + i) = SWAP16(interesting_16[j]);
-        if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
-        stage_cur++;
-
-      } else stage_max--;
-
-    }
-
-    *(u16*)(out_buf + i) = orig;
-
-  }
+  ck_free(ex_tmp);
+  memcpy(out_buf, in_buf, len);
 
   new_hit_cnt = queued_paths + unique_crashes;
 
-  stage_finds[STAGE_INTEREST16]  += new_hit_cnt - orig_hit_cnt;
-  stage_cycles[STAGE_INTEREST16] += stage_max;
+  stage_finds[STAGE_COMMENT] += new_hit_cnt - orig_hit_cnt;
+  stage_cycles[STAGE_COMMENT] += stage_max;
 
-  if (len < 4) goto skip_interest;
+  if (queue_cur->passed_det) goto havoc_stage;
 
-  /* Setting 32-bit integers, both endians. */
+  /********************
+   * DICTIONARY STUFF *
+   ********************/
 
-  stage_name  = "interest 32/8";
-  stage_short = "int32";
-  stage_cur   = 0;
-  stage_max   = 2 * (len - 3) * (sizeof(interesting_32) >> 2);
+  if (!extras_cnt) goto skip_user_extras;
 
-  orig_hit_cnt = new_hit_cnt;
+  /* Overwrite with user-supplied extras. */
 
-  for (i = 0; i < len - 3; i++) {
-
-    u32 orig = *(u32*)(out_buf + i);
-
-    stage_cur_byte = i;
-
-    for (j = 0; j < sizeof(interesting_32) / 4; j++) {
-
-      stage_cur_val = interesting_32[j];
-
-      if (interesting_32[j] != orig) {
-
-        stage_val_type = STAGE_VAL_LE;
-
-        *(u32*)(out_buf + i) = interesting_32[j];
-
-        if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
-        stage_cur++;
-
-      } else stage_max--;
-
-      if (SWAP32(interesting_32[j]) != interesting_32[j] && 
-          SWAP32(interesting_32[j]) != orig) {
-
-        stage_val_type = STAGE_VAL_BE;
-
-        *(u32*)(out_buf + i) = SWAP32(interesting_32[j]);
-        if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
-        stage_cur++;
-
-      } else stage_max--;
-
-    }
-
-    *(u32*)(out_buf + i) = orig;
-
-  }
-
-  new_hit_cnt = queued_paths + unique_crashes;
-
-  stage_finds[STAGE_INTEREST32]  += new_hit_cnt - orig_hit_cnt;
-  stage_cycles[STAGE_INTEREST32] += stage_max;
-
-skip_interest:
-
-  /************************
-   * USER-SUPPLIED EXTRAS *
-   ************************/
-
-  if (!extras_cnt || extras_cnt > MAX_DET_EXTRAS) goto skip_extras;
-
-  /* Setting 32-bit integers, both endians. */
-
-  stage_name  = "extras";
-  stage_short = "extra";
+  stage_name  = "user extras (over)";
+  stage_short = "ext_UO";
   stage_cur   = 0;
   stage_max   = extras_cnt * len;
 
@@ -4166,7 +3848,12 @@ skip_interest:
 
     for (j = 0; j < extras_cnt; j++) {
 
-      if (extras[j].len > len - i ||
+      /* Skip extras probabilistically if extras_cnt > MAX_DET_EXTRAS. Also
+         skip them if there's no room to insert the payload, or if the token
+         is redundant. */
+
+      if ((extras_cnt > MAX_DET_EXTRAS && UR(extras_cnt) >= MAX_DET_EXTRAS) ||
+          extras[j].len > len - i ||
           !memcmp(extras[j].data, out_buf + i, extras[j].len)) {
 
         stage_max--;
@@ -4188,10 +3875,99 @@ skip_interest:
 
   }
 
+  stage_cycles[STAGE_EXTRAS_UO] += stage_max;
+
+  /* Insertion of user-supplied extras. */
+
+  stage_name  = "user extras (insert)";
+  stage_short = "ext_UI";
+  stage_cur   = 0;
+  stage_max   = extras_cnt * len;
+
+  ex_tmp = ck_alloc(len + MAX_DICT_FILE);
+
+  for (i = 0; i < len; i++) {
+
+    stage_cur_byte = i;
+
+    for (j = 0; j < extras_cnt; j++) {
+
+      /* Insert token */
+      memcpy(ex_tmp + i, extras[j].data, extras[j].len);
+
+      /* Copy tail */
+      memcpy(ex_tmp + i + extras[j].len, out_buf + i, len - i);
+
+      if (common_fuzz_stuff(argv, ex_tmp, len + extras[j].len)) {
+        ck_free(ex_tmp);
+        goto abandon_entry;
+      }
+
+      stage_cur++;
+
+    }
+
+    /* Copy head */
+    ex_tmp[i] = out_buf[i];
+
+  }
+
+  ck_free(ex_tmp);
+
   new_hit_cnt = queued_paths + unique_crashes;
 
-  stage_finds[STAGE_EXTRAS]  += new_hit_cnt - orig_hit_cnt;
-  stage_cycles[STAGE_EXTRAS] += stage_max;
+  stage_finds[STAGE_EXTRAS_UI]  += new_hit_cnt - orig_hit_cnt;
+  stage_cycles[STAGE_EXTRAS_UI] += stage_max;
+
+skip_user_extras:
+
+  if (!a_extras_cnt) goto skip_extras;
+
+  stage_name  = "auto extras (over)";
+  stage_short = "ext_AO";
+  stage_cur   = 0;
+  stage_max   = MIN(a_extras_cnt, USE_AUTO_EXTRAS) * len;
+
+  stage_val_type = STAGE_VAL_NONE;
+
+  orig_hit_cnt = new_hit_cnt;
+
+  for (i = 0; i < len; i++) {
+
+    u32 last_len = 0;
+
+    stage_cur_byte = i;
+
+    for (j = 0; j < MIN(a_extras_cnt, USE_AUTO_EXTRAS); j++) {
+
+      /* See the comment in the earlier code; extras are sorted by size. */
+
+      if (a_extras[j].len > len - i ||
+          !memcmp(a_extras[j].data, out_buf + i, a_extras[j].len)) {
+
+        stage_max--;
+        continue;
+
+      }
+
+      last_len = a_extras[j].len;
+      memcpy(out_buf + i, a_extras[j].data, last_len);
+
+      if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
+
+      stage_cur++;
+
+    }
+
+    /* Restore all the clobbered memory. */
+    memcpy(out_buf + i, in_buf + i, last_len);
+
+  }
+
+  new_hit_cnt = queued_paths + unique_crashes;
+
+  stage_finds[STAGE_EXTRAS_AO]  += new_hit_cnt - orig_hit_cnt;
+  stage_cycles[STAGE_EXTRAS_AO] += stage_max;
 
 skip_extras:
 
@@ -4216,7 +3992,7 @@ havoc_stage:
 
     stage_name  = "havoc";
     stage_short = "havoc";
-    stage_max   = HAVOC_CYCLES * perf_score / 100;
+    stage_max   = HAVOC_CYCLES * perf_score / havoc_div / 100;
 
   } else {
 
@@ -4224,9 +4000,11 @@ havoc_stage:
     sprintf(tmp, "splice %u", splice_cycle);
     stage_name  = tmp;
     stage_short = "splice";
-    stage_max   = SPLICE_HAVOC * perf_score / 100;
+    stage_max   = SPLICE_HAVOC * perf_score / havoc_div / 100;
 
   }
+
+  if (stage_max < HAVOC_MIN) stage_max = HAVOC_MIN;
 
   temp_len = len;
 
@@ -4245,180 +4023,32 @@ havoc_stage:
  
     for (i = 0; i < use_stacking; i++) {
 
-      switch (UR(15 + (extras_cnt ? 2 : 0))) {
+      switch (UR(15 + (extras_cnt + a_extras_cnt ? 2 : 0))) {
 
-        case 0:
+	case 0:
 
-          /* Flip a single bit. */
+	  /* Flip a single bit somewehre. Spooky! */
 
-          FLIP_BIT(out_buf, UR(temp_len << 3));
+	  FLIP_BIT(out_buf, UR(temp_len << 3));
+	  break;
+
+	case 1:
+
+	  /* Just set a random byte to a random value. Because,
+	     why not. We use XOR with 1-255 to eliminate the
+	     possibility of a no-op. */
+
+	  out_buf[UR(temp_len)] ^= 1 + UR(255);
+	  break;
+
+        case 2 ... 10 : {
+
+          /* ascii change. */
+
+          out_buf[UR(temp_len)] = ascii_printable[UR(sizeof(ascii_printable))];
           break;
 
-        case 1: 
-
-          /* Set byte to interesting value. */
-
-          out_buf[UR(temp_len)] = interesting_8[UR(sizeof(interesting_8))];
-          break;
-
-        case 2:
-
-          /* Set word to interesting value, randomly choosing endian. */
-
-          if (temp_len < 2) break;
-
-          if (UR(2)) {
-
-            *(u16*)(out_buf + UR(temp_len - 1)) =
-              interesting_16[UR(sizeof(interesting_16) >> 1)];
-
-          } else {
-
-            *(u16*)(out_buf + UR(temp_len - 1)) = SWAP16(
-              interesting_16[UR(sizeof(interesting_16) >> 1)]);
-
-          }
-
-          break;
-
-        case 3:
-
-          /* Set dword to interesting value, randomly choosing endian. */
-
-          if (temp_len < 4) break;
-
-          if (UR(2)) {
-  
-            *(u32*)(out_buf + UR(temp_len - 3)) =
-              interesting_32[UR(sizeof(interesting_32) >> 2)];
-
-          } else {
-
-            *(u32*)(out_buf + UR(temp_len - 3)) = SWAP32(
-              interesting_32[UR(sizeof(interesting_32) >> 2)]);
-
-          }
-
-          break;
-
-        case 4:
-
-          /* Randomly subtract from byte. */
-
-          out_buf[UR(temp_len)] -= 1 + UR(ARITH_MAX);
-          break;
-
-        case 5:
-
-          /* Randomly add to byte. */
-
-          out_buf[UR(temp_len)] += 1 + UR(ARITH_MAX);
-          break;
-
-        case 6:
-
-          /* Randomly subtract from word, random endian. */
-
-          if (temp_len < 2) break;
-
-          if (UR(2)) {
-
-            u32 pos = UR(temp_len - 1);
-
-            *(u16*)(out_buf + pos) -= 1 + UR(ARITH_MAX);
-
-          } else {
-
-            u32 pos = UR(temp_len - 1);
-            u16 num = 1 + UR(ARITH_MAX);
-
-            *(u16*)(out_buf + pos) =
-              SWAP16(SWAP16(*(u16*)(out_buf + pos)) - num);
-
-          }
-
-          break;
-
-        case 7:
-
-          /* Randomly add to word, random endian. */
-
-          if (temp_len < 2) break;
-
-          if (UR(2)) {
-
-            u32 pos = UR(temp_len - 1);
-
-            *(u16*)(out_buf + pos) += 1 + UR(ARITH_MAX);
-
-          } else {
-
-            u32 pos = UR(temp_len - 1);
-            u16 num = 1 + UR(ARITH_MAX);
-
-            *(u16*)(out_buf + pos) =
-              SWAP16(SWAP16(*(u16*)(out_buf + pos)) + num);
-
-          }
-
-          break;
-
-        case 8:
-
-          /* Randomly subtract from dword, random endian. */
-
-          if (temp_len < 4) break;
-
-          if (UR(2)) {
-
-            u32 pos = UR(temp_len - 3);
-
-            *(u32*)(out_buf + pos) -= 1 + UR(ARITH_MAX);
-
-          } else {
-
-            u32 pos = UR(temp_len - 3);
-            u32 num = 1 + UR(ARITH_MAX);
-
-            *(u32*)(out_buf + pos) =
-              SWAP32(SWAP32(*(u32*)(out_buf + pos)) - num);
-
-          }
-
-          break;
-
-        case 9:
-
-          /* Randomly add to dword, random endian. */
-
-          if (temp_len < 4) break;
-
-          if (UR(2)) {
-
-            u32 pos = UR(temp_len - 3);
-
-            *(u32*)(out_buf + pos) += 1 + UR(ARITH_MAX);
-
-          } else {
-
-            u32 pos = UR(temp_len - 3);
-            u32 num = 1 + UR(ARITH_MAX);
-
-            *(u32*)(out_buf + pos) =
-              SWAP32(SWAP32(*(u32*)(out_buf + pos)) + num);
-
-          }
-
-          break;
-
-        case 10:
-
-          /* Just set a random byte to a random value. Because,
-             why not. We use XOR with 1-255 to eliminate the
-             possibility of a no-op. */
-
-          out_buf[UR(temp_len)] ^= 1 + UR(255);
-          break;
+         }
 
         case 11 ... 12: {
 
@@ -4470,7 +4100,7 @@ havoc_stage:
             if (UR(4))
               memcpy(new_buf + clone_to, out_buf + clone_from, clone_len);
             else
-              memset(new_buf + clone_to, UR(256), clone_len);
+              memset(new_buf + clone_to, UR(0x80 - 0x20 - 1) + 0x20, clone_len);
 
             /* Tail */
             memcpy(new_buf + clone_to + clone_len, out_buf + clone_to,
@@ -4512,16 +4142,36 @@ havoc_stage:
 
         case 16: {
 
-            /* Overwrite bytes with an user-specified extra. */
+            /* Overwrite bytes with an extra. */
 
-            u32 use_extra = UR(extras_cnt);
-            u32 extra_len = extras[use_extra].len;
-            u32 insert_at;
+            if (!extras_cnt || (a_extras_cnt && UR(2))) {
 
-            if (extra_len > temp_len) break;
+              /* No user-specified extras or odds in our favor. Let's use an
+                 auto-detected one. */
 
-            insert_at = UR(temp_len - extra_len + 1);
-            memcpy(out_buf + insert_at, extras[use_extra].data, extra_len);
+              u32 use_extra = UR(a_extras_cnt);
+              u32 extra_len = a_extras[use_extra].len;
+              u32 insert_at;
+
+              if (extra_len > temp_len) break;
+
+              insert_at = UR(temp_len - extra_len + 1);
+              memcpy(out_buf + insert_at, a_extras[use_extra].data, extra_len);
+
+            } else {
+
+              /* No auto extras or odds in our favor. Use the dictionary. */
+
+              u32 use_extra = UR(extras_cnt);
+              u32 extra_len = extras[use_extra].len;
+              u32 insert_at;
+
+              if (extra_len > temp_len) break;
+
+              insert_at = UR(temp_len - extra_len + 1);
+              memcpy(out_buf + insert_at, extras[use_extra].data, extra_len);
+
+            }
 
             break;
 
@@ -4529,29 +4179,50 @@ havoc_stage:
 
         case 17: {
 
-            /* Insert an user-specified extra. */
-
-            u32 use_extra = UR(extras_cnt);
-            u32 extra_len = extras[use_extra].len;
-            u32 insert_at = UR(temp_len);
+            u32 use_extra, extra_len, insert_at = UR(temp_len);
             u8* new_buf;
 
-            if (temp_len + extra_len >= MAX_FILE) break;
+            /* Insert an extra. Do the same dice-rolling stuff as for the
+               previous case. */
 
-            new_buf = ck_alloc_nozero(temp_len + extra_len);
+            if (!extras_cnt || (a_extras_cnt && UR(2))) {
 
-            /* Head */
-            memcpy(new_buf, out_buf, insert_at);
+              use_extra = UR(a_extras_cnt);
+              extra_len = a_extras[use_extra].len;
 
-            /* Inserted part */
-            memcpy(new_buf + insert_at, extras[use_extra].data, extra_len);
+              if (temp_len + extra_len >= MAX_FILE) break;
+
+              new_buf = ck_alloc_nozero(temp_len + extra_len);
+
+              /* Head */
+              memcpy(new_buf, out_buf, insert_at);
+
+              /* Inserted part */
+              memcpy(new_buf + insert_at, a_extras[use_extra].data, extra_len);
+
+            } else {
+
+              use_extra = UR(extras_cnt);
+              extra_len = extras[use_extra].len;
+
+              if (temp_len + extra_len >= MAX_FILE) break;
+
+              new_buf = ck_alloc_nozero(temp_len + extra_len);
+
+              /* Head */
+              memcpy(new_buf, out_buf, insert_at);
+
+              /* Inserted part */
+              memcpy(new_buf + insert_at, extras[use_extra].data, extra_len);
+
+            }
 
             /* Tail */
             memcpy(new_buf + insert_at + extra_len, out_buf + insert_at,
                    temp_len - insert_at);
 
             ck_free(out_buf);
-            out_buf  = new_buf;
+            out_buf   = new_buf;
             temp_len += extra_len;
 
             break;
@@ -4847,7 +4518,6 @@ static void sync_fuzzers(char** argv) {
 
 }
 
-
 /* Handle stop signal (Ctrl-C, etc). */
 
 static void handle_stop_sig(int sig) {
@@ -5142,6 +4812,10 @@ static void setup_dirs_fds(void) {
   ck_free(tmp);
 
   tmp = alloc_printf("%s/queue/.state/deterministic_done/", out_dir);
+  if (mkdir(tmp, 0700)) PFATAL("Unable to create '%s'", tmp);
+  ck_free(tmp);
+
+  tmp = alloc_printf("%s/queue/.state/auto_extras/", out_dir);
   if (mkdir(tmp, 0700)) PFATAL("Unable to create '%s'", tmp);
   ck_free(tmp);
 
@@ -5563,7 +5237,7 @@ int main(int argc, char** argv) {
 
   s32 opt;
   u64 prev_queued = 0;
-  u32 sync_interval_cnt = 0;
+  u32 sync_interval_cnt = 0, seek_to;
   u8* extras_dir = 0;
 
   SAYF(cCYA "afl-fuzz " cBRI VERSION cRST " (" __DATE__ " " __TIME__ 
@@ -5612,12 +5286,19 @@ int main(int argc, char** argv) {
         extras_dir = optarg;
         break;
 
-      case 't':
+      case 't': {
 
-        exec_tmout = atoi(optarg);
-        if (exec_tmout < 20) FATAL("Bad or dangerously low value of -t");
-        timeout_given = 1;
-        break;
+	  u8 suffix = 0;
+
+	  if (sscanf(optarg, "%u%c", &exec_tmout, &suffix) < 1)
+            FATAL("Bad syntax used for -t");
+
+	  if (exec_tmout < 20) FATAL("Dangerously low value of -t");
+
+	  if (suffix == '+') timeout_given = 2; else timeout_given = 1;
+
+	  break;
+     }
 
       case 'm': {
 
@@ -5709,11 +5390,12 @@ int main(int argc, char** argv) {
   if (sync_id) fix_up_sync();
 
   if (!strcmp(in_dir, out_dir))
-    FATAL("Input and output directories can't be the same!");
+    FATAL("Input and output directories can't be the same");
 
   if (dumb_mode && crash_mode) FATAL("-C and -n are mutually exclusive");
 
   if (getenv("AFL_NO_FORKSRV")) no_forkserver = 1;
+  if (getenv("AFL_NO_CPU_RED")) no_cpu_meter_red = 1;
 
   fix_up_banner(argv[optind]);
 
@@ -5728,6 +5410,7 @@ int main(int argc, char** argv) {
   setup_dirs_fds();
 
   read_testcases();
+  load_auto();
 
   pivot_inputs();
 
@@ -5747,9 +5430,12 @@ int main(int argc, char** argv) {
 
   show_init_stats();
 
-  if (stop_soon) goto stop_fuzzing;
+  seek_to = find_start_position();
 
   write_stats_file(0, 0);
+  save_auto();
+
+  if (stop_soon) goto stop_fuzzing;
 
   /* Woop woop woop */
 
@@ -5772,6 +5458,12 @@ int main(int argc, char** argv) {
       cur_skipped_paths = 0;
       queue_cur         = queue;
 
+      while (seek_to) {
+        current_entry++;
+	seek_to--;
+	queue_cur = queue_cur->next;
+      }
+
       show_stats();
 
       if (not_on_tty) {
@@ -5790,13 +5482,14 @@ int main(int argc, char** argv) {
 
       prev_queued = queued_paths;
 
+      if (sync_id && queue_cycle == 1 && getenv("AFL_IMPORT_FIRST"))
+        sync_fuzzers(argv + optind);
+
     }
 
     skipped_fuzz = fuzz_one(argv + optind);
 
-    if (stop_soon) break;
-
-    if (sync_id && !skipped_fuzz) {
+    if (!stop_soon && sync_id && !skipped_fuzz) {
       
       if (!(sync_interval_cnt++ % SYNC_INTERVAL))
         sync_fuzzers(argv + optind);
@@ -5812,6 +5505,10 @@ int main(int argc, char** argv) {
 
   if (queue_cur) show_stats();
 
+  write_bitmap();
+  write_stats_file(0, 0);
+  save_auto();
+
 stop_fuzzing:
 
   SAYF(cLRD "\n+++ Testing aborted by user +++\n" cRST);
@@ -5822,7 +5519,7 @@ stop_fuzzing:
 
     SAYF("\n" cYEL "[!] " cRST
            "Stopped during the first cycle, results may be incomplete.\n"
-           "    (For info on resuming, see %s/README.)\n", DOC_PATH);
+           "    (For info on resuming, see %s/README.)\n", doc_path);
 
   }
 
