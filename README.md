@@ -1,9 +1,11 @@
 This is a custom version of [afl-fuzz](http://lcamtuf.coredump.cx/afl/).
 
+Now, only support x86_64.
+
 What's new in this custom fuzzer?
 ---------------------------------
 
-1. Comment method
+1. **Comment method**
 
   The original fuzzer is only targeting javascript. 
   So, we can extract keywords using comment.
@@ -32,7 +34,7 @@ What's new in this custom fuzzer?
   ```
   now, it saves 'function' as dictionary.
 
-2. Threshold model
+2. **Threshold model**
 
   If the program is using thread, then execution path will be changed.
 
@@ -42,7 +44,7 @@ What's new in this custom fuzzer?
 
   We can only detect huge flow changes.
 
-3. Speed improvement using ptrace
+3. **Speed improvement using ptrace**
 
   The idea is come from Michal Zalewski's todo list.
 
