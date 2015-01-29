@@ -60,7 +60,6 @@ What's new in this custom fuzzer?
   This method works pretty well in JavaScriptCore.
   Performance increases 2.5x
 
-  But in case of v8, v8 reads input on new thread.
-  It is hard to make forkserver on a new thread.
-  There may be similar problems.
-  So, this problem should be fixed.
+  But in case of v8, it is not stable.
+  I'm finding what the problem is.
+  (Temporarily, add `access("[start]",0);`. then, it will start from that line)

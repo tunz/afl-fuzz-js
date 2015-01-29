@@ -279,6 +279,34 @@ int wait_for_syscall(pid_t p) {
   }
 }
 
+/* Read string from ptrace */
+
+u8* read_string(pid_t pid, unsigned long addr) {
+
+  unsigned long tmp;
+  int read_byte=0;
+  u8 *tmp_str = ck_alloc(1024);
+
+  while (1) {
+
+    if (read_byte + sizeof(tmp)> 1024)
+      break;
+
+    tmp = ptrace(PTRACE_PEEKDATA, pid, addr + read_byte);
+    if(errno != 0) {
+      tmp_str[read_byte] = 0;
+      break;
+    }
+
+    memcpy(tmp_str + read_byte, &tmp, sizeof tmp);
+    if (memchr(&tmp, 0, sizeof(tmp)) != NULL)
+      break;
+    read_byte += sizeof(tmp);
+  }
+
+  return tmp_str;
+}
+
 /* Spin up fork server (instrumented mode only). The idea is explained here:
 
    http://lcamtuf.blogspot.com/2014/10/fuzzing-binaries-without-execve.html
@@ -425,6 +453,8 @@ void init_forkserver(char** argv) {
     /* If we don't find first read yet. */
 
     int syscall;
+    int correct_location = 0;
+
 
     ACTF("Finding start point."); 
 
@@ -442,19 +472,38 @@ void init_forkserver(char** argv) {
       syscall = ptrace(PTRACE_PEEKUSER, forksrv_pid, 
 		      __builtin_offsetof(struct user, regs.orig_eax));
 #endif
+      if (syscall == SYS_access) {
+
+	  u8* access_fname;
+	  unsigned long fname_addr;
+
+#ifdef __x86_64__
+          fname_addr = ptrace(PTRACE_PEEKUSER, forksrv_pid,
+		      __builtin_offsetof(struct user, regs.rdi));
+#else
+          fname_addr = ptrace(PTRACE_PEEKUSER, forksrv_pid,
+		      __builtin_offsetof(struct user, regs.ebx));
+#endif
+	  /* Read filename opened by child */
+	  access_fname = read_string(forksrv_pid, fname_addr);
+
+	  if (!strcmp(access_fname, "[start]"))
+            correct_location = 1;
+
+	  ck_free(access_fname);
+      }
 
       if ((!out_file && syscall == SYS_read) || 
 	   (out_file && syscall == SYS_open)) {
 
-	int correct_location = 1;
+	correct_location = 1;
 
 	if (out_file) {
 
           u8* cwd = getcwd(NULL, 0);
 	  u8* out_file_fullpath;
-	  u8* open_fname = ck_alloc(1024);
-	  unsigned long fname_addr, tmp;
-	  int read_byte=0;
+	  u8* open_fname;
+	  unsigned long fname_addr;
 
           if (out_file[0] == '/') out_file_fullpath = out_file;
           else out_file_fullpath = alloc_printf("%s/%s", cwd, out_file);
@@ -467,47 +516,32 @@ void init_forkserver(char** argv) {
 		      __builtin_offsetof(struct user, regs.ebx));
 #endif
 	  /* Read filename opened by child */
-          while (1) {
-
-            if (read_byte + sizeof(tmp)> 1024)
-              break;
-
-            tmp = ptrace(PTRACE_PEEKDATA, forksrv_pid, fname_addr + read_byte);
-            if(errno != 0) {
-              open_fname[read_byte] = 0;
-              break;
-            }
-
-            memcpy(open_fname + read_byte, &tmp, sizeof tmp);
-            if (memchr(&tmp, 0, sizeof(tmp)) != NULL)
-              break;
-            read_byte += sizeof(tmp);
-          }
+	  open_fname = read_string(forksrv_pid, fname_addr);
 
 	  if (strcmp(open_fname, out_file_fullpath) != 0)
             correct_location = 0;
-
 
           if (out_file[0] != '/') ck_free(out_file_fullpath);
 	  ck_free(open_fname);
 	}
 
-	if (correct_location) {
+      }
 
-          start_address = *((void **)trace_bits);
+      if (correct_location) {
 
-	  ACTF("Start address found: %p",start_address); 
+        start_address = *((void **)trace_bits);
 
-          if (start_address)
-            memset(trace_bits, 0, MAP_SIZE);
-	  else
-            FATAL("Fail to find start address");
+        ACTF("Start address found: %p",start_address); 
 
-          /* kill current child, and restart with known start address. */
-	  kill(forksrv_pid, SIGKILL);
-          waitpid(forksrv_pid, &status, WUNTRACED);
-	  return init_forkserver(argv);
-	}
+        if (start_address)
+          memset(trace_bits, 0, MAP_SIZE);
+	else
+          FATAL("Fail to find start address");
+
+        /* kill current child, and restart with known start address. */
+	kill(forksrv_pid, SIGKILL);
+        waitpid(forksrv_pid, &status, WUNTRACED);
+	return init_forkserver(argv);
       }
 
     }
