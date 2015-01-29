@@ -40,6 +40,7 @@
 #include <sys/resource.h>
 #include <stdio.h>
 #include <errno.h>
+#include <sys/personality.h>
 
 #define AFL_RUN
 
@@ -303,6 +304,13 @@ void init_forkserver(char** argv) {
   if (!forksrv_pid) {
 
     struct rlimit r;
+
+    /* Disable ASLR */
+#ifdef __x86__64__
+    syscall(SYS_personality, ADDR_NO_RANDOMIZE | PER_LINUX);
+#else
+    syscall(SYS_personality, ADDR_NO_RANDOMIZE | PER_LINUX32);
+#endif
 
     /* Umpf. On OpenBSD, the default fd limit for root users is set to
        soft 128. Let's try to fix that... */
