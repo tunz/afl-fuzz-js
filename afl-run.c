@@ -499,8 +499,7 @@ void init_forkserver(char** argv) {
 	  ACTF("Start address found: %p",start_address); 
 
           if (start_address)
-            memset(trace_bits, 0, 
-	  	 MAP_SIZE < sizeof(void *) ? MAP_SIZE : sizeof(void *));
+            memset(trace_bits, 0, MAP_SIZE);
 	  else
             FATAL("Fail to find start address");
 
@@ -511,8 +510,6 @@ void init_forkserver(char** argv) {
 	}
       }
 
-      //if (wait_for_syscall(forksrv_pid))
-      //  FATAL("Program dead before read first input.");
     }
   } else {
     /* Check if fork server set. */

@@ -383,7 +383,7 @@ static const u8* main_payload_64 =
   "  /* stage 1 : Init fork server.       */\n"
   "  /* stage 2 : Trace flow (afl store). */\n"
   "\n"
-  "  /* Check if SHM creation and Init fork server is finished. */\n"
+  "  /* Check if SHM is created and Init fork server is finished. */\n"
   "  movb  __afl_stage(%rip), %dl\n"
   "  cmpb  $2, %dl\n"
   "  je    __afl_store\n"
@@ -393,7 +393,7 @@ static const u8* main_payload_64 =
   "  je    __afl_setup\n"
   "\n"
   "__afl_check_addr:\n"
-  "  /* If this is start address, Init fork server. */\n"
+  "  /* If this point is start address, Init fork server. */\n"
   "  movq  (%rsp), %rdx\n"
   "  cmpq  %rdx, __afl_start_addr(%rip)\n"
   "  jne   __afl_save_addr\n"
@@ -408,7 +408,7 @@ static const u8* main_payload_64 =
   "\n"
   "__afl_store:\n"
   "\n"
-  "  movq  __afl_area_ptr(%rip), %rdx\n"
+  "  movq __afl_area_ptr(%rip), %rdx\n"
   "\n"
   "  /* Calculate and store hit for the code location specified in ecx. */\n"
   "\n"
@@ -459,7 +459,25 @@ static const u8* main_payload_64 =
   "  je    __afl_setup_first\n"
   "\n"
   "  movq %rdx, __afl_area_ptr(%rip)\n"
-  "  jmp  __afl_store\n" 
+  "\n"
+#ifndef __APPLE__
+  "  movq  __afl_global_start_addr@GOTPCREL(%rip), %rdx\n"
+  "  movq  (%rdx), %rdx\n"
+  "  movq  %rdx, __afl_start_addr(%rip)\n"
+  "  movq  __afl_global_stage@GOTPCREL(%rip), %rdx\n"
+  "  movb  (%rdx), %dl\n"
+  "  movb  %dl, __afl_stage(%rip)\n"
+#else
+  "  movq  __afl_global_start_addr(%rip), %rdx\n"
+  "  movq  %rdx, __afl_start_addr(%rip)\n"
+  "  movb  __afl_global_stage(%rip), %dl\n"
+  "  movb  %dl, __afl_stage(%rip)\n"
+#endif
+  "\n"
+  "  cmpb  $2, %dl\n"
+  "  je    __afl_store\n"
+  "  jmp  __afl_check_addr\n"
+  "  jmp  __afl_store\n"
   "\n"
   "__afl_setup_first:\n"
   "\n"
@@ -552,6 +570,18 @@ static const u8* main_payload_64 =
   "  movq $" STRINGIFY((FORKSRV_FD)) ", %rdi       /* file desc */\n"
   CALL_L64("read")
   "\n"
+#ifndef __APPLE__
+  "  movq __afl_start_addr(%rip), %rcx /* data      */\n"
+  "  movq __afl_global_start_addr@GOTPCREL(%rip), %rdx\n"
+  "  movq %rcx, (%rdx)\n"
+  "  movq __afl_global_stage@GOTPCREL(%rip), %rdx\n"
+  "  movb $0x1, (%rdx)\n"
+#else
+  "  movq __afl_start_addr(%rip), %rdx /* data      */\n"
+  "  movq %rdx, __afl_global_start_addr(%rip)\n"
+  "  movb $0x1, __afl_global_stage(%rip)\n"
+#endif /* ^__APPLE__ */
+  "\n"
   "  /* Set stage 1. */\n"
   "  movb  $1, __afl_stage(%rip)\n" 
   "  /* Store the address of the SHM region. */\n"
@@ -577,6 +607,12 @@ static const u8* main_payload_64 =
   "__afl_forkserver:\n"
   "\n"
   "  movb $2, __afl_stage(%rip)\n" 
+#ifndef __APPLE__
+  "  movq __afl_global_stage@GOTPCREL(%rip), %rdx\n"
+  "  movb $0x2, (%rdx)\n"
+#else
+  "  movb $0x2, __afl_global_stage(%rip)\n"
+#endif /* ^__APPLE__ */
   "\n"
   "  /* Enter the fork server mode to avoid the overhead of execve() calls. We\n"
   "     push rdx (area ptr) twice to keep stack alignment neat. */\n"
@@ -773,7 +809,9 @@ static const u8* main_payload_64 =
 
 #endif /* ^__APPLE__ */
 
+  "  .comm    __afl_global_start_addr, 8, 8\n"
   "  .comm    __afl_global_area_ptr, 8, 8\n"
+  "  .comm    __afl_global_stage, 8, 8\n"
   "\n"
   ".AFL_SHM_ENV:\n"
   "  .asciz \"" SHM_ENV_VAR "\"\n"
