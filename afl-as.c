@@ -217,6 +217,15 @@ static void add_instrumentation(void) {
 
     if (pass_thru) continue;
 
+    if (strncmp("\t.string \"[start]\"", line, 18) == 0) {
+
+      fseek(outf, -19, SEEK_CUR);
+
+      fprintf(outf, use_64bit ? trampoline_fmt_64 : trampoline_fmt_32, (unsigned int)-1);
+
+      ins_lines++;
+    }
+
     /* We only want to instrument the .text section. So, let's keep track
        of that in processed files. */
 
@@ -301,13 +310,7 @@ static void add_instrumentation(void) {
 
     if (line[0] == '\t') {
 
-      if (strncmp("\tcall\taccess", line, 12) == 0 || strncmp("\tjmp\taccess", line, 11) == 0) {
-
-        fprintf(outf, use_64bit ? trampoline_fmt_64 : trampoline_fmt_32, (unsigned int)-1);
-
-        ins_lines++;
-
-      } else if (line[1] == 'j' && line[2] != 'm' && R(100) < inst_ratio) {
+      if (line[1] == 'j' && line[2] != 'm' && R(100) < inst_ratio) {
 
         fprintf(outf, use_64bit ? trampoline_fmt_64 : trampoline_fmt_32,
                 R(MAP_SIZE));

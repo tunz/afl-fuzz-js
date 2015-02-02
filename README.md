@@ -65,5 +65,12 @@ What's new in this custom fuzzer?
 
   **(Temporarily, use user defined start address)**
   
-  Add `access("[start]",0);` to your source code, and add -U option for afl-fuzz. 
-  Then, it will start from that line.
+  Add
+  ```C
+  asm(".string \"[start]\"");
+  ```
+  to what you want to start from.
+
+  Add -U option for afl-fuzz. 
+
+  Then, It will start from that line.
