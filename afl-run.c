@@ -446,6 +446,12 @@ void init_forkserver(char** argv) {
 
   rlen = long_read(fsrv_st_fd, &status, 4);
 
+  if (user_defined_start_address) {
+
+    ACTF("Continue to user defined start point."); 
+    start_address = (void *)1;
+  }
+
   if (write(fsrv_ctl_fd, &start_address, status) < status) 
     FATAL("Incomplete sending start address.");
 
@@ -472,26 +478,6 @@ void init_forkserver(char** argv) {
       syscall = ptrace(PTRACE_PEEKUSER, forksrv_pid, 
 		      __builtin_offsetof(struct user, regs.orig_eax));
 #endif
-      if (syscall == SYS_access) {
-
-	  u8* access_fname;
-	  unsigned long fname_addr;
-
-#ifdef __x86_64__
-          fname_addr = ptrace(PTRACE_PEEKUSER, forksrv_pid,
-		      __builtin_offsetof(struct user, regs.rdi));
-#else
-          fname_addr = ptrace(PTRACE_PEEKUSER, forksrv_pid,
-		      __builtin_offsetof(struct user, regs.ebx));
-#endif
-	  /* Read filename opened by child */
-	  access_fname = read_string(forksrv_pid, fname_addr);
-
-	  if (!strcmp(access_fname, "[start]"))
-            correct_location = 1;
-
-	  ck_free(access_fname);
-      }
 
       if ((!out_file && syscall == SYS_read) || 
 	   (out_file && syscall == SYS_open)) {

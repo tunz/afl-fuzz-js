@@ -6,6 +6,10 @@
 
    Copyright 2013, 2014 Google Inc. All rights reserved.
 
+   User defined start point by Han Choongwoo <cwhan.tunz@gmail.com>
+
+   Copyright 2015 Naver Corp.
+
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
    You may obtain a copy of the License at:
@@ -297,7 +301,13 @@ static void add_instrumentation(void) {
 
     if (line[0] == '\t') {
 
-      if (line[1] == 'j' && line[2] != 'm' && R(100) < inst_ratio) {
+      if (strncmp("\tcall\taccess", line, 12) == 0 || strncmp("\tjmp\taccess", line, 11) == 0) {
+
+        fprintf(outf, use_64bit ? trampoline_fmt_64 : trampoline_fmt_32, (unsigned int)-1);
+
+        ins_lines++;
+
+      } else if (line[1] == 'j' && line[2] != 'm' && R(100) < inst_ratio) {
 
         fprintf(outf, use_64bit ? trampoline_fmt_64 : trampoline_fmt_32,
                 R(MAP_SIZE));

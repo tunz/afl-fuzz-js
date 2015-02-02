@@ -37,6 +37,7 @@ u8  *out_file,                  /* File to fuzz, if any             */
 
 u8  dumb_mode,                 /* Run in non-instrumented mode?    */
     showmap_mode,              /* Run on afl-showmap               */
+    user_defined_start_address,/* User defined Start address       */
     uses_asan,                 /* Target uses ASAN?                */
     kill_signal,               /* Signal that killed the child     */
     no_forkserver,             /* Disable forkserver?              */

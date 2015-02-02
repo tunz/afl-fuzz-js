@@ -4768,6 +4768,7 @@ static void usage(u8* argv0) {
        "  -T text       - text banner to show on the screen\n"
        "  -M / -S id    - distributed mode (see parallel_fuzzing.txt)\n"
        "  -C            - crash exploration mode (the peruvian rabbit thing)\n\n"
+       "  -U            - user defined start address mode ('access(\"[start]\",0);')\n\n"
 
        "For additional tips, please consult %s/README.\n\n",
 
@@ -5245,7 +5246,7 @@ int main(int argc, char** argv) {
 
   doc_path = access(DOC_PATH, F_OK) ? "docs" : DOC_PATH;
 
-  while ((opt = getopt(argc,argv,"+i:o:f:m:t:T:dnCB:S:M:x:")) > 0)
+  while ((opt = getopt(argc,argv,"+i:o:f:m:t:T:dnCUB:S:M:x:")) > 0)
 
     switch (opt) {
 
@@ -5363,6 +5364,11 @@ int main(int argc, char** argv) {
         if (crash_mode) FATAL("Multiple -C options not supported");
         crash_mode = FAULT_CRASH;
         break;
+
+      case 'U':
+
+        user_defined_start_address = 1;
+	break;
 
       case 'n':
 

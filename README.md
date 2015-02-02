@@ -62,4 +62,8 @@ What's new in this custom fuzzer?
 
   But in case of v8, it is not stable.
   I'm finding what the problem is.
-  (Temporarily, add `access("[start]",0);`. then, it will start from that line)
+
+  **(Temporarily, use user defined start address)**
+  
+  Add `access("[start]",0);` to your source code, and add -U option for afl-fuzz. 
+  Then, it will start from that line.
