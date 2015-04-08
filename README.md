@@ -63,14 +63,63 @@ What's new in this custom fuzzer?
   But in case of v8, it is not stable.
   I'm finding what the problem is.
 
-  **(Temporarily, use user defined start address)**
+Usage for Webkit JSC
+--------------------
+
+It is almost same with original AFL.
+
+**Download afl-fuzz-js**
+```
+$ git clone https://github.com/tunz/afl-fuzz-js.git
+$ cd afl-fuzz-js
+$ make
+```
+you can configure through the config.h file before compile the afl-fuzz-js.
+
+**Download Webkit**
+```
+$ cd ~
+$ svn checkout https://svn.webkit.org/repository/webkit/trunk webkit
+$ cd webkit
+```
+
+**Build with afl-fuzz-js**
+```
+$ export AFL_HARDEN=1
+$ export AFL_INST_RATIO=30
+$ export CC=/path/to/afl-gcc
+$ export CXX=/path/to/afl-g++
+$ ./Toos/Scripts/build-jsc --gtk --makeargs="-j4"
+```
+You can remove gtk option, or change makeargs arguments.
+You can also compile with address santinizer. I think it would be very efficient, but I didn't tried yet.
+The value of AFL_HARDEN , AFL_INST_RATIO, CC, or CXX also can be changed by you.
+It depends on your choice and situation.
+
+**Fuzz with afl-fuzz-js**
+```
+$ cd ~
+$ mkdir fuzz
+$ cd fuzz
+$ cp ~/webkit/WebKitBuild/Release/bin/jsc ./jsc
+$ /path/to/afl-fuzz -i [input directory] -o [output directory] -x [dictionary directory] -m 8G ./jsc @@
+```
+-m option also depends on your situation.
+You can parallelize it using -M and -S option.
+If you add more samples to input directory, it would be more efficient.
+
+**(If there is error that can't find start position, or there is crash)**
+
+Sometimes, there would be some problem (e.g. v8). Temporarily, use user defined start address.
   
-  Add
-  ```C
-  asm(".string \"[start]\"");
-  ```
-  to what you want to start from.
+Add
+```C
+asm(".string \"[start]\"");
+```
+to what you want to start from. it specify the start position by user, not automatically.
 
-  Add -U option for afl-fuzz. 
-
-  Then, It will start from that line.
+Add -U option when you start afl-fuzz. 
+```
+$ /path/to/afl-fuzz -i [input directory] -o [output directory] -x [dictionary directory] -m 8G -U ./jsc @@
+```
+Then, It will start from that line.
