@@ -16,7 +16,7 @@ What's new in this custom fuzzer?
   function abc() { print(1); }
   ```
 
-  then, comment method will check exammples like this.
+  then, comment method will check examples like this.
   ```js
   /**/f/*unction abc() { print(1); }*/
   ```
