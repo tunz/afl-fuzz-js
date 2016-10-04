@@ -89,7 +89,7 @@ $ export AFL_HARDEN=1
 $ export AFL_INST_RATIO=30
 $ export CC=/path/to/afl-gcc
 $ export CXX=/path/to/afl-g++
-$ ./Toos/Scripts/build-jsc --gtk --makeargs="-j4"
+$ ./Tools/Scripts/build-jsc --gtk --makeargs="-j4"
 ```
 You can remove gtk option, or change makeargs arguments.
 You can also compile with address santinizer. I think it would be very efficient, but I didn't tried yet.
