@@ -1,3 +1,10 @@
+
+This repository is **not maintained**, and too old.
+
+I recommend you to use [afl-fuzz](http://lcamtuf.coredump.cx/afl/), which is much more improved and the current version of afl-fuzz includes most features of afl-fuzz-js.
+
+---
+
 This is a custom version of [afl-fuzz](http://lcamtuf.coredump.cx/afl/).
 
 Now, only support x86_64.
